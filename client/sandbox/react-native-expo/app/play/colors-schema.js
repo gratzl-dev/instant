@@ -1,4 +1,4 @@
-import { init_experimental, i } from "@instantdb/react-native";
+import { init, i } from "@instantdb/react-native";
 import { View, Text, Button, StyleSheet } from "react-native";
 
 import config from "../config";
@@ -9,13 +9,10 @@ const schema = i.schema({
       color: i.string(),
     }),
   },
-  links: {},
-  rooms: {},
 });
 
-const { useQuery, transact, tx } = init_experimental({
-  appId: config.appId,
-  websocketURI: "wss://api.instantdb.com/runtime/session",
+const { useQuery, transact, tx } = init({
+  ...config,
   schema,
 });
 

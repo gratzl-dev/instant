@@ -46,7 +46,7 @@
                               :db/index true}
    :instaql-query/stale? {:db/type :db.type/boolean}
    :instaql-query/version {:db/type :db.type/integer}
-   :instaql-query/hash {:db/type :db.type/string}
+   :instaql-query/hash {:db/type :db.type/number}
    ;; This would be easier if we had a store per app
    :instaql-query/session-id+query
    {:db/tupleAttrs [:instaql-query/session-id :instaql-query/query]
@@ -436,12 +436,19 @@
             false
             small)))
 
-(defn like-match? [text pattern]
+(defn make-like-match? [case-insensitive? text pattern]
   (let [regex-pattern (-> pattern
                           (string/replace "_" ".")
                           (string/replace "%" ".*")
-                          (#(str "^" % "$")))]
+                          (#(str (when case-insensitive?
+                                   "(?i)")
+                                 "^"
+                                 %
+                                 "$")))]
     (re-matches (re-pattern regex-pattern) text)))
+
+(def like-match? (partial make-like-match? false))
+(def ilike-match? (partial make-like-match? true))
 
 (defn- match-topic-part? [iv-part dq-part]
   (cond
@@ -456,7 +463,8 @@
                 :$gte >=
                 :$lt <
                 :$lte <=
-                :$like like-match?)]
+                :$like like-match?
+                :$ilike ilike-match?)]
         (some (fn [v]
                 (f v value))
               iv-part))
