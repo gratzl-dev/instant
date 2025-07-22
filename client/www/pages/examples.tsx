@@ -8,7 +8,11 @@ import { useInView } from 'react-intersection-observer';
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/router';
 import { useIsHydrated } from '@/lib/hooks/useIsHydrated';
-import { InstantReactWebDatabase, InstantUnknownSchema, init } from '@instantdb/react';
+import {
+  InstantReactWebDatabase,
+  InstantUnknownSchema,
+  init,
+} from '@instantdb/react';
 import { errorToast } from '@/lib/toast';
 import { ToastContainer } from 'react-toastify';
 import {
@@ -18,6 +22,7 @@ import {
   MainNav,
 } from '@/components/marketingUi';
 import { useAuthToken } from '@/lib/auth';
+import * as og from '@/lib/og';
 
 export async function getStaticProps() {
   const files = getFiles();
@@ -150,7 +155,11 @@ function Main({ files }: { files: File[] }) {
     <LandingContainer>
       <Head>
         <title>Instant Examples</title>
-        <meta name="description" content="A Graph Database on the Client" />
+        <meta
+          key="og:image"
+          property="og:image"
+          content={og.url({ section: 'examples' })}
+        />
       </Head>
       <ToastContainer />
 

@@ -12,7 +12,7 @@
 (def etype "$users")
 
 (defn create!
-  ([params] (create! (aurora/conn-pool) params))
+  ([params] (create! (aurora/conn-pool :write) params))
   ([conn {:keys [id app-id email]}]
    (update-op
     conn
@@ -24,7 +24,7 @@
       (get-entity id)))))
 
 (defn get-by-id
-  ([params] (get-by-id (aurora/conn-pool) params))
+  ([params] (get-by-id (aurora/conn-pool :read) params))
   ([conn {:keys [app-id id]}]
    (query-op conn
              {:app-id app-id
@@ -32,21 +32,31 @@
              (fn [{:keys [get-entity]}]
                (get-entity id)))))
 
+(defn get-by-ids
+  ([params] (get-by-ids (aurora/conn-pool :read) params))
+  ([conn {:keys [app-id ids]}]
+   (query-op conn
+             {:app-id app-id
+              :etype etype}
+             (fn [{:keys [get-entities]}]
+               (get-entities ids)))))
+
 (defn get-by-refresh-token
-  ([params] (get-by-refresh-token (aurora/conn-pool) params))
+  ([params] (get-by-refresh-token (aurora/conn-pool :read) params))
   ([conn {:keys [app-id refresh-token]}]
-   (query-op
-    conn
-    {:app-id app-id
-     :etype etype}
-    (fn [{:keys [get-entity-where]}]
-      (get-entity-where {:$userRefreshTokens.hashedToken (hash-token refresh-token)})))))
+   (when refresh-token
+     (query-op
+      conn
+      {:app-id app-id
+       :etype etype}
+      (fn [{:keys [get-entity-where]}]
+        (get-entity-where {:$userRefreshTokens.hashedToken (hash-token refresh-token)}))))))
 
 (defn get-by-refresh-token! [params]
   (ex/assert-record! (get-by-refresh-token params) :app-user {:args [params]}))
 
 (defn get-by-email
-  ([params] (get-by-email (aurora/conn-pool) params))
+  ([params] (get-by-email (aurora/conn-pool :read) params))
   ([conn {:keys [app-id email]}]
    (query-op conn
              {:app-id app-id
@@ -58,7 +68,7 @@
   (ex/assert-record! (get-by-email params) :app-user {:args [params]}))
 
 (defn update-email!
-  ([params] (update-email! (aurora/conn-pool) params))
+  ([params] (update-email! (aurora/conn-pool :write) params))
   ([conn {:keys [id app-id email]}]
    (update-op
     conn
@@ -69,7 +79,7 @@
       (get-entity id)))))
 
 (defn delete-by-email!
-  ([params] (delete-by-email! (aurora/conn-pool) params))
+  ([params] (delete-by-email! (aurora/conn-pool :write) params))
   ([conn {:keys [app-id email]}]
    (update-op
     conn
@@ -79,7 +89,7 @@
       (delete-entity! [(resolve-id :email) email])))))
 
 (defn delete-by-id!
-  ([params] (delete-by-id! (aurora/conn-pool) params))
+  ([params] (delete-by-id! (aurora/conn-pool :write) params))
   ([conn {:keys [app-id id]}]
    (update-op
     conn
@@ -88,9 +98,8 @@
     (fn [{:keys [delete-entity!]}]
       (delete-entity! id)))))
 
-
 (defn get-by-email-or-oauth-link-qualified
-  ([params] (get-by-email-or-oauth-link-qualified (aurora/conn-pool) params))
+  ([params] (get-by-email-or-oauth-link-qualified (aurora/conn-pool :read) params))
   ([conn {:keys [app-id email sub provider-id]}]
    (query-op
     conn

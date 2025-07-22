@@ -9,6 +9,14 @@ import { useEffect, useRef, useState } from 'react';
 import { Button, Checkbox, Label, TextInput } from '@/components/ui';
 import { dbAttrsToExplorerSchema } from '@/lib/schema';
 import clsx from 'clsx';
+import useLocalStorage from '@/lib/hooks/useLocalStorage';
+import {
+  Combobox,
+  ComboboxInput,
+  ComboboxOption,
+  ComboboxOptions,
+} from '@headlessui/react';
+import { InstantReactWebDatabase } from '@instantdb/react';
 
 let cachedSandboxValue = '';
 
@@ -16,10 +24,22 @@ try {
   cachedSandboxValue = getLocal('__instant_sandbox_value') ?? '';
 } catch (error) {}
 
-export function Sandbox({ app }: { app: InstantApp }) {
+export function Sandbox({
+  app,
+  db,
+}: {
+  app: InstantApp;
+  db: InstantReactWebDatabase<any>;
+}) {
   const consoleRef = useRef<HTMLDivElement>(null);
-  const [sandboxCodeValue, setSandboxValue] = useState(cachedSandboxValue);
-  const [runAsUserEmail, setRunAsUserEmail] = useState('');
+  const [sandboxCodeValue, setSandboxValue] = useLocalStorage(
+    `__instant_sandbox_value:${app.id}`,
+    cachedSandboxValue,
+  );
+  const [runAsUserEmail, setRunAsUserEmail] = useLocalStorage(
+    `__instant_sandbox_email:${app.id}`,
+    '',
+  );
   const [dangerouslyCommitTx, setDangerouslyCommitTx] = useState(false);
   const [appendResults, setAppendResults] = useState(false);
   const [collapseQuery, setHideQuery] = useState(false);
@@ -31,12 +51,15 @@ export function Sandbox({ app }: { app: InstantApp }) {
     app.rules ? JSON.stringify(app.rules, null, 2) : '',
   );
   const [output, setOutput] = useState<any[]>([]);
+  const [showRunning, setShowRunning] = useState(false);
+  const [isExecuting, setIsExecuting] = useState(false);
 
   function out(
     type: 'log' | 'error' | 'query' | 'transaction' | 'eval',
     data: any,
+    execTimeMs?: number,
   ) {
-    setOutput((o) => o.concat({ type, data }));
+    setOutput((o) => o.concat({ type, data, execTimeMs }));
   }
 
   useEffect(() => {
@@ -64,6 +87,11 @@ export function Sandbox({ app }: { app: InstantApp }) {
   }, [output]);
 
   const exec = async () => {
+    if (isExecuting) return;
+
+    setIsExecuting(true);
+    const timer = setTimeout(() => setShowRunning(true), 200);
+
     if (!appendResults) {
       setOutput([]);
     } else if (output.length) {
@@ -100,13 +128,14 @@ export function Sandbox({ app }: { app: InstantApp }) {
     const _db = {
       transact: async (s: any) => {
         try {
+          const startTime = performance.now();
           const response = await adminDb.debugTransact(s, {
             rules,
             // @ts-expect-error because this is a private API - shh! 🤫
             __dangerouslyCommit: dangerouslyCommitTx,
           });
-
-          out('transaction', { response, rules });
+          const execTimeMs = performance.now() - startTime;
+          out('transaction', { response, rules }, execTimeMs);
 
           return { 'tx-id': response['tx-id'] };
         } catch (error) {
@@ -114,13 +143,12 @@ export function Sandbox({ app }: { app: InstantApp }) {
           throw error;
         }
       },
-      query: async (q: any) => {
+      query: async (q: any, opts?: any) => {
         try {
-          const response = await adminDb.debugQuery(q, {
-            rules,
-          });
-
-          out('query', { response, rules });
+          const startTime = performance.now();
+          const response = await adminDb.debugQuery(q, { rules, ...opts });
+          const execTimeMs = performance.now() - startTime;
+          out('query', { response, rules }, execTimeMs);
 
           return response.result;
         } catch (error) {
@@ -128,6 +156,7 @@ export function Sandbox({ app }: { app: InstantApp }) {
           throw error;
         }
       },
+      tx,
     };
 
     try {
@@ -139,22 +168,25 @@ export function Sandbox({ app }: { app: InstantApp }) {
       } catch (error) {
         out('error', {
           message:
-            'Oops!  There was an error evaluating your code.  Please check your syntax and try again.',
+            'Oops! There was an error evaluating your code. Please check your syntax and try again.',
         });
-
         throw error;
       }
 
-      f(_console, _db, id, tx, lookup).then(
-        () => {},
-        (error: any) => {
-          out('error', {
-            message: (error as any)?.message || 'Error running code',
-          });
-        },
-      );
+      try {
+        await f(_console, _db, id, tx, lookup);
+      } catch (error: any) {
+        out('error', {
+          message: error?.message || 'Error running code',
+        });
+        throw error;
+      }
     } catch (error) {
       console.error(error);
+    } finally {
+      clearTimeout(timer);
+      setShowRunning(false);
+      setIsExecuting(false);
     }
   };
 
@@ -168,8 +200,12 @@ export function Sandbox({ app }: { app: InstantApp }) {
           <div className="py-1 px-2 bg-gray-50 border-b text-xs flex gap-2 items-center justify-between">
             <div className="flex gap-2 items-center">
               JS Sandbox
-              <Button size="nano" onClick={() => execRef.current()}>
-                Run
+              <Button
+                size="nano"
+                onClick={() => execRef.current()}
+                disabled={showRunning}
+              >
+                {showRunning ? 'Running...' : 'Run'}
               </Button>
               <div className="ml-3">
                 <Checkbox
@@ -199,8 +235,6 @@ export function Sandbox({ app }: { app: InstantApp }) {
               value={sandboxCodeValue}
               onChange={(v) => {
                 setSandboxValue(v ?? '');
-                cachedSandboxValue = v ?? '';
-                setLocal('__instant_sandbox_value', v ?? '');
               }}
               options={{
                 scrollBeyondLastLine: false,
@@ -242,6 +276,23 @@ export function Sandbox({ app }: { app: InstantApp }) {
                   },
                 );
               }}
+            />
+          </div>
+        </div>
+        <div className="flex flex-col border-b">
+          <div className="flex flex-col px-2 py-1 gap-1 bg-gray-50 border-b text-xs">
+            Context
+          </div>
+          <div className="px-2 py-1 flex gap-2 items-center">
+            <Label className="text-xs font-normal">
+              Set <code className="px-2 border bg-white">auth.email</code>
+            </Label>
+            <EmailInput
+              key={app.id}
+              db={db}
+              email={runAsUserEmail}
+              setEmail={setRunAsUserEmail}
+              onEnter={execRef.current}
             />
           </div>
         </div>
@@ -295,28 +346,6 @@ export function Sandbox({ app }: { app: InstantApp }) {
                 />
               )}
             </div>
-          </div>
-        </div>
-
-        <div className="flex flex-col border-b">
-          <div className="flex flex-col px-2 py-1 gap-1 bg-gray-50 border-b text-xs">
-            Context
-          </div>
-          <div className="px-2 py-1 flex gap-2 items-center">
-            <Label className="text-xs font-normal">
-              Set <code className="px-2 border bg-white">auth.email</code>
-            </Label>
-            <TextInput
-              className="text-xs px-2 py-0.5"
-              placeholder="happyuser@instantdb.com"
-              value={runAsUserEmail}
-              onChange={setRunAsUserEmail}
-              onKeyDown={(e) => {
-                if (e.metaKey && e.key === 'Enter') {
-                  execRef.current();
-                }
-              }}
-            />
           </div>
         </div>
       </div>
@@ -388,7 +417,10 @@ export function Sandbox({ app }: { app: InstantApp }) {
                     'text-purple-600': o.type === 'transaction',
                   })}
                 >
-                  {o.type}
+                  {o.type}{' '}
+                  {o.execTimeMs != null
+                    ? ` - (${o.execTimeMs.toFixed(1)} ms)`
+                    : ''}
                 </div>
                 {o.type === 'log' && !collapseLog && (
                   <div className="flex flex-col p-3 gap-1">
@@ -549,6 +581,83 @@ export function Sandbox({ app }: { app: InstantApp }) {
   );
 }
 
+function EmailInput({
+  db,
+  email,
+  setEmail,
+  onEnter,
+}: {
+  db: InstantReactWebDatabase<any>;
+  email: string;
+  setEmail: (email: string) => void;
+  onEnter: () => void;
+}) {
+  const { data } = db.useQuery({
+    $users: {
+      $: {
+        where: {
+          email: { $ilike: `%${email}%` },
+        },
+        limit: 10,
+        fields: ['email'],
+      },
+    },
+  });
+
+  // @ts-ignore: expects users to have unknown properties
+  const comboOptions: { id: string; email: string }[] = data?.$users || [];
+
+  return (
+    <Combobox
+      value={email}
+      onChange={(email) => {
+        setEmail(email ?? '');
+      }}
+      immediate={true}
+    >
+      <ComboboxInput
+        size={32}
+        className="text-xs px-2 py-0.5"
+        value={email}
+        onChange={(e) => {
+          setEmail(e.target.value);
+        }}
+        onKeyDown={(e) => {
+          if (e.metaKey && e.key === 'Enter') {
+            onEnter();
+          }
+        }}
+        placeholder="happyuser@instantdb.com"
+      />
+      <ComboboxOptions
+        anchor="bottom start"
+        modal={false}
+        className="mt-1 w-[var(--input-width)] overflow-auto bg-white shadow-lg z-10 border border-gray-300 divide-y"
+      >
+        {!email ? (
+          <ComboboxOption
+            key="none"
+            value=""
+            className={clsx('text-xs px-2 py-0.5 data-[focus]:bg-blue-100', {})}
+          >
+            <span>{'<none>'}</span>
+          </ComboboxOption>
+        ) : null}
+
+        {comboOptions.map((user, i) => (
+          <ComboboxOption
+            key={user.id}
+            value={user.email}
+            className={clsx('text-xs px-2 py-0.5 data-[focus]:bg-blue-100', {})}
+          >
+            <span>{user.email}</span>
+          </ComboboxOption>
+        ))}
+      </ComboboxOptions>
+    </Combobox>
+  );
+}
+
 function Data({
   data,
   collapsed,
@@ -588,7 +697,7 @@ function initialSandboxValue(name: string) {
   const namePropCode = isJsSimpleKey(name) ? `.${name}` : `["${name}"]`;
   return `
 // This is a space to hack on queries and mutations
-// \`db\`, \`id\`, \`tx\`, and \`lookup\` are all available globally
+// \`db\`, \`id\`, and \`lookup\` are all available globally
 // Press Cmd/Ctrl + Enter to run the code
 
 const res = await db.query({
@@ -605,7 +714,7 @@ console.log('${name} ID:', itemId);
 
 if (itemId) {
   await db.transact([
-    tx${namePropCode}[itemId].update({ test: 1 }),
+    db.tx${namePropCode}[itemId].update({ test: 1 }),
   ]);
 }
 `.trim();
@@ -614,17 +723,20 @@ if (itemId) {
 const tsTypes = /* ts */ `
 type InstantDB = {
   transact: (steps) => Promise<number>;
-  query: (iql) => Promise<any>;
+  query: (iql, opts?: {ruleParams?: Record<string, any>}) => Promise<any>;
+  tx: InstantTx;
 };
 
 type InstantTx = {
   [namespace: string]: {
     [id: string]: {
-      update: (v: Record<string, any>) => any;
+      create: (v: Record<string, any>) => any;
+      update: (v: Record<string, any>, opts?: {upsert?: boolean | undefined}) => any;
       merge: (v: Record<string, any>) => any;
       delete: () => any;
       link: (v: Record<string, string>) => any;
       unlink: (v: Record<string, string>) => any;
+      ruleParams: (v: Record<string, any>) => any;
     };
   };
 };

@@ -1,8 +1,9 @@
 ---
 title: Clerk
+description: How to integrate Clerk's auth flow with Instant.
 ---
 
-Instant supports delegating auth to Clerk.
+Instant supports auth with Clerk.
 
 ## Setup
 
@@ -52,7 +53,7 @@ import { init } from '@instantdb/react';
 import { useEffect } from 'react';
 
 // Instant app
-const APP_ID = "__APP_ID__";
+const APP_ID = '__APP_ID__';
 
 const db = init({ appId: APP_ID });
 

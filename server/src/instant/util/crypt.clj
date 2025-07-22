@@ -3,6 +3,8 @@
   (:import
    (java.security MessageDigest)
    (java.util UUID)
+   (javax.crypto Mac)
+   (javax.crypto.spec SecretKeySpec)
    (com.google.crypto.tink Aead JsonKeysetReader TinkJsonProtoKeysetFormat
                            CleartextKeysetHandle HybridEncrypt HybridDecrypt
                            KeysetHandle
@@ -15,6 +17,7 @@
                                   HybridDecryptWrapper$WrappedHybridDecrypt
                                   HybridEncryptWrapper$WrappedHybridEncrypt)
    (com.google.crypto.tink.integration.awskms AwsKmsClient)
+   (com.google.crypto.tink.subtle Random)
    (org.apache.commons.codec.binary Hex)))
 
 (defn uuid->sha256
@@ -37,6 +40,15 @@
   [^String s]
   (.digest (MessageDigest/getInstance "MD5") (.getBytes s)))
 
+(defn str->utf-8-bytes
+  "Converts a string to a byte array using UTF-8 encoding"
+  [^String s]
+  (.getBytes s "UTF-8"))
+
+;; The md5 of json null in postgres
+;; select md5('null') or (-> "null" str->md5 bytes->hex-string)
+(def json-null-md5 "37a6259cc0c1dae299a7866489dff0bd")
+
 (defn constant-bytes=
   "Constant time comparison to prevent timing attacks"
   [bytes-a bytes-b]
@@ -57,6 +69,17 @@
 
 (defn hex-string->bytes [^String s]
   (Hex/decodeHex s))
+
+(defn random-bytes [^Long size]
+  (Random/randBytes size))
+
+(defn random-hex [^Long size]
+  (bytes->hex-string (Random/randBytes size)))
+
+(defn hmac-256 [^bytes secret-key ^bytes b]
+  (let [mac (Mac/getInstance "HmacSHA256")]
+    (.init mac (SecretKeySpec. secret-key "HmacSHA256"))
+    (.doFinal mac b)))
 
 (defonce default-aead (atom nil))
 
@@ -155,7 +178,6 @@
 (defn init [aead-config]
   (init-aead aead-config)
   (init-hybrid))
-
 
 ;; Utilities for bootstrap
 

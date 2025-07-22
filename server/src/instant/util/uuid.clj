@@ -1,14 +1,31 @@
 (ns instant.util.uuid
+  (:refer-clojure :exclude [parse-uuid])
   (:import
    (java.util UUID)
+   (java.security MessageDigest)
    (java.nio ByteBuffer))
   (:require
-   [clojure.string :as string]))
+   [clojure.string :as string]
+   [clojure+.walk :as walk]))
+
+(defn parse-uuid [s]
+  (when (and (string? s) (= 36 (.length ^String s)))
+    (try
+      (UUID/fromString s)
+      (catch IllegalArgumentException _
+        nil))))
 
 (defn coerce [x]
   (cond (uuid? x) x
         (string? x) (parse-uuid (string/trim x))
         :else nil))
+
+(defn str->uuid
+  "Convert a string to a deterministic UUID using SHA-256"
+  [^String s]
+  (let [md (MessageDigest/getInstance "SHA-256")
+        bytes (.digest md (.getBytes s))]
+    (UUID/nameUUIDFromBytes bytes)))
 
 (defn ->bytes
   "Converts a java.util.UUID into a byte array"
@@ -40,3 +57,8 @@
             0
             ;; starting indexes of each hex-pair
             [0 2 4 6 9 11 14 16 19 21 24 26 28 30 32 34])))
+
+(defn walk-uuids
+  "Converts string instances of UUIDs to java UUIDs"
+  [m]
+  (walk/postwalk #(or (parse-uuid %) %) m))

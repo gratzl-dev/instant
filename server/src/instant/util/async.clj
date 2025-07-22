@@ -1,9 +1,10 @@
 (ns instant.util.async
-  (:refer-clojure :exclude [future-call])
+  (:refer-clojure :exclude [future-call pmap])
   (:require
    [clojure.core.async :as a]
    [clojure.core.async.impl.buffers]
    [clojure.core.async.impl.protocols :as a-impl]
+   [instant.flags :as flags]
    [instant.gauges :as gauges]
    [instant.util.tracer :as tracer])
   (:import
@@ -40,10 +41,22 @@
                                          :escaping?   false
                                          :thread-name (.getName thread)}))))
 
+(defn wrap-catch-unhandled-exceptions [f]
+  (fn [& args]
+    (try
+      (apply f args)
+      (catch Throwable t
+        (when-some [handler (.getUncaughtExceptionHandler (Thread/currentThread))]
+          (.uncaughtException handler (Thread/currentThread) t))
+        (throw t)))))
+
 ;; ---------------
 ;; virtual-threads
 
-(def ^ExecutorService default-virtual-thread-executor (Executors/newVirtualThreadPerTaskExecutor))
+(defn make-virtual-thread-executor ^ExecutorService []
+  (Executors/newVirtualThreadPerTaskExecutor))
+
+(defonce ^ExecutorService default-virtual-thread-executor (make-virtual-thread-executor))
 
 (defn ^:private deref-future
   "Private function copied from clojure.core;
@@ -55,6 +68,31 @@
    (try (.get fut timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)
         (catch java.util.concurrent.TimeoutException _
           timeout-val))))
+
+(defn worker-vfuture-call [^ExecutorService executor f]
+  (let [f   (wrap-catch-unhandled-exceptions f)
+        fut (.submit executor ^Callable f)]
+    (reify
+      clojure.lang.IDeref
+      (deref [_] (deref-future fut))
+      clojure.lang.IBlockingDeref
+      (deref [_ timeout-ms timeout-val]
+        (deref-future fut timeout-ms timeout-val))
+      clojure.lang.IPending
+      (isRealized [_] (.isDone fut))
+      java.util.concurrent.Future
+      (get [_] (.get fut))
+      (get [_ timeout unit] (.get fut timeout unit))
+      (isCancelled [_] (.isCancelled fut))
+      (isDone [_] (.isDone fut))
+      (cancel [_ interrupt?]
+        (.cancel fut interrupt?)))))
+
+(defmacro worker-vfuture
+  "Creates a vfuture that does not propagate bindings and does not
+   track immediate children. Useful for starting a background worker."
+  [^ExecutorService executor & body]
+  `(worker-vfuture-call ~executor (^{:once true} fn* [] ~@body)))
 
 ;; Keeps track of child futures so that we can cancel them if the
 ;; parent is canceled.
@@ -68,6 +106,7 @@
         ;; virtual threads
         children (ConcurrentHashMap.)
         ^ConcurrentHashMap parent-vfutures *child-vfutures*
+        f (wrap-catch-unhandled-exceptions f)
         f (bound-fn* (^{:once true} fn* []
                       (if dont-track-immediate-children?
                         (f)
@@ -99,6 +138,9 @@
       (.put parent-vfutures fut-id wrapped-fut))
     wrapped-fut))
 
+(defmacro tracked-future [& body]
+  `(future-call clojure.lang.Agent/soloExecutor nil (^{:once true} fn* [] ~@body)))
+
 (defmacro vfuture
   "Takes a body of expressions and yields a future object that will
   invoke the body in a **virtual thread**, and will cache the result and
@@ -108,7 +150,13 @@
   [& body]
   `(future-call default-virtual-thread-executor nil (^{:once true} fn* [] ~@body)))
 
-(defn vfuture-pmap
+(defmacro severed-vfuture
+  "Like vfuture, but won't get canceled if the parent is canceled."
+  [& body]
+  `(binding [*child-vfutures* nil]
+     (future-call default-virtual-thread-executor nil (^{:once true} fn* [] ~@body))))
+
+(defn pmap
   "Like pmap, but uses vfutures to parallelize the work.
 
   Why would you want to use this instead of pmap?
@@ -120,8 +168,12 @@
   This executor is unbounded, so even if you have a recursive function, 
   you won't deadlock."
   [f coll]
-  (let [futs (mapv #(vfuture (f %)) coll)]
-    (mapv deref futs)))
+  (->> coll
+       ;; mapv to force entire seq
+       (mapv #(if (flags/use-vfutures?)
+                (vfuture (f %))
+                (tracked-future (f %))))
+       (mapv deref)))
 
 (defmacro vfut-bg
   "Futures only throw when de-referenced. vfut-bg writes a future with a
@@ -206,3 +258,8 @@
                           (name chan-name))
             :value (a-impl/full? buf)}])))
      chan)))
+
+(defn all-of [& futures]
+  (future
+    (doseq [f futures]
+      (deref f))))

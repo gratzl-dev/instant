@@ -1,5 +1,5 @@
-import { pick } from "./utils/pick";
-import { areObjectsShallowEqual, areObjectKeysEqual } from "./utils/object";
+import { pick } from './utils/pick.js';
+import { areObjectsShallowEqual, areObjectKeysEqual } from './utils/object.js';
 
 export type RoomSchemaShape = {
   [k: string]: {
@@ -16,6 +16,8 @@ export type PresenceOpts<PresenceShape, Keys extends keyof PresenceShape> = {
   user?: boolean;
   peers?: string[];
   keys?: Keys[];
+  // Initial presence data to set when joining the room
+  initialData?: Partial<PresenceShape>;
 };
 
 type PresencePeer<PresenceShape, Keys extends keyof PresenceShape> = Pick<
@@ -55,7 +57,7 @@ export function buildPresenceSlice<
     peers: {},
   };
 
-  const includeUser = opts && "user" in opts ? opts.user : true;
+  const includeUser = opts && 'user' in opts ? opts.user : true;
 
   if (includeUser) {
     const user = pick(data.user ?? {}, opts?.keys);

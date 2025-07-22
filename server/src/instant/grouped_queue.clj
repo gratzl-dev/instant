@@ -1,155 +1,209 @@
 (ns instant.grouped-queue
-  (:refer-clojure :exclude [peek])
+  (:require
+   [clojure+.core :as clojure+]
+   [instant.config :as config]
+   [instant.gauges :as gauges]
+   [instant.util.tracer :as tracer])
   (:import
-   (java.util.concurrent LinkedBlockingQueue TimeUnit)
-   (java.util.concurrent.atomic AtomicInteger)
-   (clojure.lang PersistentQueue)))
+   (java.util Map Queue)
+   (java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue Executor Executors ExecutorService TimeUnit)
+   (java.util.concurrent.atomic AtomicInteger)))
 
-;; ----------- 
-;; inflight-queue
+(defn- execute [{:keys [executor error-fn]} ^Runnable task]
+  (try
+    (Executor/.execute executor task)
+    (catch Exception e
+      (if error-fn
+        (error-fn e)
+        (throw e)))))
 
-(def persisted-q-empty PersistentQueue/EMPTY)
+(defn- poll
+  "Gets 0..∞ items from group, fetching as many combinable items as possible in a row.
+   Returns 1 (possibly combined) item or nil"
+  [group combine-fn]
+  (loop [item1 (Queue/.poll group)]
+    (clojure+/cond+
+     (nil? item1) nil
+     :let [item2 (Queue/.peek group)]
+     (nil? item2) item1
+     :let [item12 (combine-fn item1 item2)]
+     (nil? item12) item1
+     :else (do
+             (Queue/.remove group) ;; remove item2
+             (recur (assoc item12 ::combined (inc (::combined item1 1))))))))
 
-(defn pop-times [n coll]
-  (reduce (fn [coll _] (pop coll)) coll (range n)))
+(declare process)
 
-(comment
-  (def x (into persisted-q-empty [1 2 3]))
-  (pop-times 2 x)
-  (take 2 x))
+(deftype ProcessTask [q key group]
+  Runnable
+  (run [this]
+    (process this q key group)))
 
-(def inflight-queue-empty
-  {:pending persisted-q-empty
-   :working []})
+(defn- clean-or-reschedule [process-task {:keys [groups] :as q} group key]
+  (when (= ::reschedule (locking q
+                          (if (some? (Queue/.peek group))
+                            ::reschedule
+                            (Map/.remove groups key))))
+    (execute q process-task)))
 
-(defn inflight-queue-put [inflight-queue item]
-  (update inflight-queue :pending conj item))
-
-(defn inflight-queue-empty? [{:keys [pending working] :as _inflight-queue}]
-  (and (empty? pending) (empty? working)))
-
-(defn inflight-queue-workset [{:keys [working]}]
-  working)
-
-(defn inflight-queue-workset-clear [inflight-queue]
-  (assoc inflight-queue :working []))
-
-(defn inflight-queue-peek-pending [{:keys [pending] :as _inflight-queue}]
-  (first pending))
-
-(defn inflight-queue-reserve [max-items {:keys [pending working]}]
-  {:pending (pop-times max-items pending)
-   :working (into working (take max-items pending))})
-
-(defn inflight-queue-reserve-all [{:keys [pending working]}]
-  {:pending persisted-q-empty
-   :working (into working pending)})
-
-;; ----------- 
-;; grouped-queue
-
-(defn create [{:keys [group-fn]}]
-  {:size (AtomicInteger. 0)
-   :group-fn group-fn
-   :group-key->subqueue (atom {})
-   :dispatch-queue (LinkedBlockingQueue.)})
-
-(defn size [{:keys [size] :as _grouped-q}]
-  (.get size))
-
-(defn put! [{:keys [group-fn dispatch-queue group-key->subqueue size]
-             :as _grouped-q} item]
-  (let [group-key (group-fn item)]
-    (if (nil? group-key)
-      ;; This item is not to be grouped.
-      (do (.incrementAndGet size)
-          (.put dispatch-queue [:item item]))
-
-      ;; This item will be grouped on `group-key` 
-      (let [_ (.incrementAndGet size)
-            [prev] (locking group-key->subqueue
-                     (swap-vals! group-key->subqueue
-                                 update
-                                 group-key
-                                 (fnil inflight-queue-put inflight-queue-empty)
-                                 item))
-            prev-subqueue (get prev group-key)
-            first-enqueue? (inflight-queue-empty? prev-subqueue)]
-        (when first-enqueue?
-          (.put dispatch-queue [:group-key group-key]))))))
-
-(defn peek [{:keys [dispatch-queue group-key->subqueue] :as _grouped-q}]
-  (let [[t arg :as entry] (.peek dispatch-queue)]
-    (cond
-      (nil? entry) nil
-      (= t :item) arg
-      (= t :group-key) (inflight-queue-peek-pending (get @group-key->subqueue arg)))))
-
-(defn default-reserve-fn [_ inflight-q] (inflight-queue-reserve 1 inflight-q))
-
-(defn clear-subqueue [state group-key]
-  (let [subqueue (get state group-key)
-        cleared-subqueue (inflight-queue-workset-clear subqueue)]
-    (if (inflight-queue-empty? cleared-subqueue)
-      (dissoc state group-key)
-      (assoc state group-key cleared-subqueue))))
-
-(defn process-polling!
-  [{:keys [dispatch-queue group-key->subqueue size] :as _grouped-q}
-   {:keys [reserve-fn
-           process-fn
-           poll-ms]
-    :or {poll-ms 1000
-         reserve-fn default-reserve-fn}}]
-  (let [[t arg :as entry] (.poll dispatch-queue poll-ms TimeUnit/MILLISECONDS)]
-    (cond
-      (nil? entry) nil
-
-      (= t :item)
+(defn- process
+  "Main worker process function"
+  [process-task
+   {:keys [process-fn
+           combine-fn
+           num-workers
+           num-items
+           processing?] :as q}
+   key
+   group]
+  (AtomicInteger/.incrementAndGet num-workers)
+  (when @processing?
+    (if-some [item (poll group combine-fn)]
       (do
-        (process-fn nil [arg])
-        (.decrementAndGet size)
-        true)
-
-      (= t :group-key)
-      (let [group-key arg
-
-            reserved (locking group-key->subqueue
-                       (swap! group-key->subqueue update group-key (partial reserve-fn group-key)))
-
-            reserved-subqueue (get reserved group-key)
-
-            workset (inflight-queue-workset reserved-subqueue)]
-
         (try
-          (process-fn group-key workset)
-          true
-          (finally
-            (let [cleared (locking group-key->subqueue
-                            (swap! group-key->subqueue clear-subqueue group-key))
-                  cleared-subqueue (get cleared group-key)]
-              (.addAndGet size (- (count workset)))
-              (when (inflight-queue-peek-pending cleared-subqueue)
-                (.put dispatch-queue [:group-key group-key])))))))))
+          (process-fn key item)
+          (catch Throwable t
+            (tracer/record-exception-span! t {:name "grouped-queue/process-error"})))
+        (AtomicInteger/.addAndGet num-items (- (::combined item 1)))
+        (if (some? (Queue/.peek group))
+          (execute q process-task)
+          (clean-or-reschedule process-task q group key)))
+      (clean-or-reschedule process-task q group key)))
+  (AtomicInteger/.decrementAndGet num-workers))
 
-(comment
-  (def gq (create {:group-fn :k}))
-  (put! gq {:k :refresh})
-  (put! gq {:k :refresh})
-  (put! gq {:k :add-query})
-  (put! gq {:k :refresh})
-  (put! gq {:k :remove-query})
-  (peek gq)
-  gq
-  (future
-    (process-polling! gq
-                      {:reserve-fn (fn [group-key inflight-queue]
-                                     (if (= group-key :refresh)
-                                       (inflight-queue-reserve-all inflight-queue)
-                                       (inflight-queue-reserve 1 inflight-queue)))
+(defn put!
+  "Schedule item for execution on q"
+  [{:keys [groups group-key-fn num-items num-puts accepting?] :as q} item]
+  (when @accepting?
+    (let [item   (assoc item ::put-at (System/currentTimeMillis))
+          key    (or (group-key-fn item) ::default)
+          process-task (locking q
+                         (if-some [group (Map/.get groups key)]
+                           (do
+                             (Queue/.offer group item)
+                             nil)
+                           (let [group (ConcurrentLinkedQueue. [item])]
+                             (Map/.put groups key group)
+                             (ProcessTask. q key group))))]
+      (when process-task
+        (execute q process-task))
+      (AtomicInteger/.incrementAndGet num-items)
+      (AtomicInteger/.incrementAndGet num-puts))))
 
-                       :process-fn (fn [k workset]
-                                     (println "processing..." k workset)
-                                     #_(Thread/sleep 10000)
-                                     (println "done"))})))
+(defn- longest-wait-time [groups]
+  (when-some [items (->> groups
+                         (Map/.values)
+                         (keep Queue/.peek)
+                         not-empty)]
+    (let [now (System/currentTimeMillis)]
+      (- now (transduce (map ::put-at) min now items)))))
 
+(defn start
+  "Options:
+
+     :group-key-fn :: (fn [item]) -> Any
+
+   A function to determine to which “track” to send item for processing.
+   All tracks are processed in parallel, items inside one track are processed sequentially.
+
+     :combine-fn   :: (fn [item1 item2]) -> item | nil
+
+   A function that can optionally combine two items into one before processing.
+   Return nil if items shouldn’t be combined.
+
+     :process-fn   :: (fn [group-key item])
+
+   Main processing function. Item passed to it might have additional ::combined and ::put-at keys.
+
+     :executor     :: ExecutorService | nil
+
+   An exectutor to use to run worker threads. Should support unbounded task queue.
+
+     :max-workers  :: long | nil
+
+   If exectutor is not provided, ~ cached thread pool will be created with at most this many threads.
+
+     :metrics-path :: String | nil
+
+   A string to report gauge metrics to. If skipped, no reporting"
+  [{:keys [group-key-fn combine-fn process-fn error-fn executor max-workers metrics-path]
+    :or {max-workers 2}}]
+  (let [groups       (ConcurrentHashMap.)
+        accepting?   (atom true)
+        processing?  (atom true)
+        num-items    (AtomicInteger. 0)
+        num-puts     (AtomicInteger. 0)
+        num-workers  (AtomicInteger. 0)
+        executor     (cond
+                       (some? executor)
+                       executor
+
+                       config/fewer-vfutures?
+                       (Executors/newFixedThreadPool max-workers)
+                       #_(doto (ThreadPoolExecutor. max-workers max-workers 60 TimeUnit/SECONDS (LinkedBlockingQueue.))
+                           (.allowCoreThreadTimeOut true))
+
+                       :else
+                       (Executors/newVirtualThreadPerTaskExecutor))
+        cleanup-fn   (when metrics-path
+                       (gauges/add-gauge-metrics-fn
+                        (fn [_]
+                          [{:path  (str metrics-path ".size")
+                            :value (AtomicInteger/.get num-items)}
+                           (when-some [t (longest-wait-time groups)]
+                             {:path  (str metrics-path ".longest-waiting-ms")
+                              :value t})
+                           {:path (str metrics-path ".worker-count")
+                            :value (AtomicInteger/.get num-workers)}
+                           #_{:path (str metrics-path ".pool-size")
+                              :value (ThreadPoolExecutor/.getPoolSize executor)}
+                           {:path (str metrics-path ".num-puts")
+                            :value (AtomicInteger/.getAndSet num-puts 0)}])))
+        shutdown-fn  (fn [{:keys [timeout-ms]
+                           :or {timeout-ms 1000}}]
+                       (when cleanup-fn
+                         (cleanup-fn))
+                       (reset! accepting? false)
+                       (ExecutorService/.shutdown executor)
+                       (if (ExecutorService/.awaitTermination executor timeout-ms TimeUnit/MILLISECONDS)
+                         :shutdown
+                         (do
+                           (reset! processing? false)
+                           (if (ExecutorService/.awaitTermination executor timeout-ms TimeUnit/MILLISECONDS)
+                             :shutdown
+                             (do
+                               (ExecutorService/.shutdownNow executor)
+                               :terminated)))))]
+    {:group-key-fn (or group-key-fn identity)
+     :combine-fn   (or combine-fn (fn [_ _] nil))
+     :process-fn   process-fn
+     :error-fn     error-fn
+     :groups       groups
+     :accepting?   accepting?
+     :processing?  processing?
+     :num-items    num-items
+     :num-puts     num-puts
+     :num-workers  num-workers
+     :executor     executor
+     :shutdown-fn  shutdown-fn}))
+
+(defn stop
+  "Stops grouped queue. Shuts executor down. Possible options:
+
+     :timeout-ms :: long
+
+   How long to wait for existing tasks to finish processing before interrupting."
+  ([q]
+   ((:shutdown-fn q) {}))
+  ([q opts]
+   ((:shutdown-fn q) opts)))
+
+(defn num-items
+  "~ Amount of items currently in all queues"
+  [q]
+  (AtomicInteger/.get (:num-items q)))
+
+(defn num-workers
+  "~ Amount of workers currently in all queues"
+  [q]
+  (AtomicInteger/.get (:num-workers q)))

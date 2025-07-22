@@ -16,7 +16,7 @@
   (:import
    (java.util UUID)))
 
-(defn extract-zeneca-txes [checked-data?]
+(defn extract-zeneca-txes [{:keys [checked-data? indexed-data?]}]
   (let [imported (<-json (slurp (io/resource "sample_triples/zeneca.json")))
         triples (->> imported
                      (remove (fn [[_ a v]]
@@ -71,19 +71,22 @@
                      (= "id" idn)
                      {:id uuid
                       :forward-identity [(java.util.UUID/randomUUID) nsp "id"]
-                      :reverse-identity [(java.util.UUID/randomUUID) nsp "_id"]
                       :cardinality :one
-                      :value-type :ref
+                      :value-type :blob
                       :unique? true
-                      :index? true}
+                      :index? false}
                      :else
                      (merge
                       {:id uuid
                        :forward-identity [(java.util.UUID/randomUUID) nsp idn]
                        :cardinality :one
                        :value-type :blob
-                       :unique? (boolean (#{"email" "handle" "isbn13"} idn))
-                       :index? (boolean (#{"email" "handle" "title" "order"} idn))}
+                       :unique? (if-not indexed-data?
+                                  false
+                                  (boolean (#{"email" "handle" "isbn13"} idn)))
+                       :index? (if-not indexed-data?
+                                 false
+                                 (boolean (#{"email" "handle" "title" "order"} idn)))}
                       (when-let [data-type (when checked-data?
                                              (case idn
                                                ("email"
@@ -110,23 +113,29 @@
 
 (defn add-zeneca-to-app!
   "Bootstraps an app with zeneca data."
-  ([app-id] (add-zeneca-to-app! false app-id))
-  ([checked-data? app-id]
+  ([app-id] (add-zeneca-to-app! (aurora/conn-pool :write)
+                                {:checked-data? false
+                                 :indexed-data? true}
+                                app-id))
+  ([opts app-id]
+   (add-zeneca-to-app! (aurora/conn-pool :write) opts app-id))
+  ([conn {:keys [checked-data? indexed-data?]} app-id]
    ;; Note: This is ugly code, but it works.
    ;; Maybe we clean it up later, but we don't really need to right now.
    ;; One idea for a cleanup, is to create an "exported app" file.
    ;; We can then write a function that works on this kind of file schema.
-   (attr-model/delete-by-app-id! (aurora/conn-pool) app-id)
-   (let [txes (extract-zeneca-txes checked-data?)
+   (attr-model/delete-by-app-id! conn app-id)
+   (let [txes (extract-zeneca-txes {:checked-data? checked-data?
+                                    :indexed-data? indexed-data?})
          _ (tx/transact!
-            (aurora/conn-pool)
+            conn
             (attr-model/get-by-app-id app-id)
             app-id
             txes)
          triples (triple-model/fetch
-                  (aurora/conn-pool)
+                  conn
                   app-id)
-         attrs (attr-model/get-by-app-id app-id)
+         attrs (attr-model/get-by-app-id conn app-id)
          users (for [[_ group] (group-by first (map :triple triples))
                      :when (= (attr-model/fwd-etype
                                (attr-model/seek-by-id (second (first group))
@@ -135,10 +144,29 @@
                      :let [{:strs [email id]}
                            (entity-model/triples->map {:attrs attrs} group)]]
                  {:email email
-                  :id id
-                  :app-id app-id})]
+                  :id (parse-uuid id)
+                  :app-id app-id})
+         created-at-triples (filter (fn [{[_e a] :triple}]
+                                      (-> (attr-model/seek-by-id a attrs)
+                                          attr-model/fwd-label
+                                          (= "createdAt")))
+                                    triples)]
+     ;; Set the created_at field on the triples to the right one because
+     ;; the tests rely on it.
+     (doseq [{[e a v] :triple} created-at-triples
+             :let [etype (attr-model/fwd-etype
+                          (attr-model/seek-by-id a attrs))
+                   id-attr (attr-model/seek-by-fwd-ident-name [etype "id"] attrs)]]
+       (sql/execute! conn (hsql/format {:update :triples
+                                        :set {:created-at (.toEpochMilli (triple-model/parse-date-value v))}
+                                        :where [:and
+                                                [:= :entity-id e]
+                                                [:= :attr-id (:id id-attr)]
+                                                [:= :value-md5 [:md5 [:cast [:cast (->json e) :json] :text]]]
+                                                [:= :app-id app-id]]
+                                        :returning :*})))
      (doseq [user users]
-       (app-user-model/create! user))
+       (app-user-model/create! conn user))
 
      (count triples))))
 
@@ -218,7 +246,7 @@
   ;; Maybe we clean it up later, but we don't really need to right now.
   ;; One idea for a cleanup, is to create an "exported app" file.
   ;; We can then write a function that works on this kind of file schema.
-  (attr-model/delete-by-app-id! (aurora/conn-pool) app-id)
+  (attr-model/delete-by-app-id! (aurora/conn-pool :write) app-id)
   (let [json-triples
         (<-json (slurp (io/resource "sample_triples/movie.json")))
         id-triples
@@ -297,12 +325,12 @@
 
     (uspec/conform-throwing ::tx/tx-steps tx-steps)
 
-    (tx/transact! (aurora/conn-pool)
+    (tx/transact! (aurora/conn-pool :write)
                   (attr-model/get-by-app-id app-id)
                   app-id
                   tx-steps)
 
     (count (triple-model/fetch
-            (aurora/conn-pool)
+            (aurora/conn-pool :read)
             app-id))))
 

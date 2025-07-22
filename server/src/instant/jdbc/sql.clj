@@ -1,7 +1,9 @@
 (ns instant.jdbc.sql
+  (:refer-clojure :exclude [format])
   (:require
    [clojure.string :as string]
    ;; load all pg-ops for hsql
+   [honey.sql :as hsql]
    [honey.sql.pg-ops]
    [instant.util.exception :as ex]
    [instant.util.io :as io]
@@ -13,32 +15,48 @@
    [next.jdbc.result-set :as rs]
    [next.jdbc.sql :as sql])
   (:import
-   (clojure.lang IPersistentList IPersistentMap IPersistentVector)
+   (clojure.lang IPersistentList IPersistentMap IPersistentSet IPersistentVector)
    (com.zaxxer.hikari HikariDataSource)
    (java.sql Array Connection PreparedStatement ResultSet ResultSetMetaData)
    (java.time Instant LocalDate LocalDateTime)
+   (java.util UUID)
+   (javax.sql DataSource)
    (org.postgresql.util PGobject PSQLException)))
+
+(set! *warn-on-reflection* true)
 
 (defn ->pg-text-array
   "Formats as text[] in pg, i.e. {item-1, item-2, item3}"
   [col]
-  (format
+  (clojure.core/format
    "{%s}"
    (string/join
     ","
-    (map (fn [s] (format "\"%s\""
-                         ;; Escape quotes (but don't double esc)
-                         (string/replace s #"(?<!\\)\"" "\\\"")))
+    (map (fn [s] (clojure.core/format "\"%s\""
+                                      ;; Escape quotes (but don't double esc)
+                                      (string/replace s #"(?<!\\)\"" "\\\"")))
          col))))
+
+(defn ->pg-uuid-array
+  "Formats as uuid[] in pg, i.e. {item-1, item-2, item3}"
+  [uuids]
+  (let [s (StringBuilder. "{")]
+    (doseq [^UUID uuid uuids]
+      (when (not= 1 (.length s))
+        (.append s \,))
+      (.append s (.toString uuid)))
+    (.append s "}")
+    (.toString s)))
 
 (defn ->pgobject
   "Transforms Clojure data to a PGobject that contains the data as
   JSON. PGObject type defaults to `jsonb` but can be changed via
   metadata key `:pgtype`"
-  [x]
+  ^PGobject [x]
   (let [pgtype (or (:pgtype (meta x)) "jsonb")
         value (case pgtype
                 "text[]" (->pg-text-array x)
+                "uuid[]" (->pg-uuid-array x)
                 (->json x))]
     (doto (PGobject.)
       (.setType pgtype)
@@ -87,6 +105,10 @@
 
   IPersistentVector
   (set-parameter [v ^PreparedStatement s i]
+    (.setObject s i (->pgobject v)))
+
+  IPersistentSet
+  (set-parameter [v ^PreparedStatement s i]
     (.setObject s i (->pgobject v))))
 
 (defn get-unqualified-string-column-names
@@ -102,6 +124,132 @@
   (let [rsmeta (.getMetaData rs)
         cols   (get-unqualified-string-column-names rsmeta opts)]
     (rs/->MapResultSetBuilder rs rsmeta cols)))
+
+(defn elementset
+  "A way to pass sequence as an input to honeysql.
+
+   Given:
+
+     (def xs
+       [1 2 3])
+
+   One can use:
+
+     (hsql/format
+      (elementset xs {:as 'id, :type :int}))
+
+   To get to:
+
+     SELECT CAST(elem AS INT) AS id
+       FROM JSONB_ARRAY_ELEMENTS_TEXT(CAST(? AS JSONB)) AS elem
+
+   This is better than passing arrays as argument with ARRAY and UNNEST
+   because it always generates one input paramter (does not depend on a length
+   of the input array, `?` vs `?, ?, ?, ...`) and handles empty arrays the same
+   way in handles non-empty ones."
+  [xs {:keys [as type]}]
+  {:select
+   [[[:cast 'elem (or type :text)] as]]
+   :from [[[:jsonb_array_elements_text [:cast (->json xs) :jsonb]] 'elem]]})
+
+(defn tupleset
+  "A way to pass seq-of-tuples as an input to honeysql.
+
+   Given:
+
+     (def ts
+       [[1 \"Ivan\" 85]
+        [2 \"Oleg\" 92]
+        [3 \"Petr\" 68]])
+
+   One can use:
+
+     (hsql/format
+      (tupleset ts
+                [{:as 'id, :type :int}
+                 {:as 'full-name}
+                 {:as 'score, :type :int}]))
+
+   To get to:
+
+     SELECT CAST(elem ->> 0 AS INT) AS id,
+            CAST(elem ->> 1 AS TEXT) AS full_name,
+            CAST(elem ->> 2 AS INT) AS score
+       FROM JSONB_ARRAY_ELEMENTS(CAST(? AS JSONB)) AS elem"
+  [ts cols]
+  {:select
+   (for [[idx {:keys [type as]}] (map vector (range) cols)]
+     [[:cast [:->> 'elem [:inline idx]] (or type :text)] as])
+   :from
+   [[[:jsonb_array_elements [:cast (->json ts) :jsonb]] 'elem]]})
+
+(defn recordset
+  "A way to pass seq-of-maps as an input to honeysql.
+
+   Given:
+
+     (def rs
+       [{:id 1, :name \"Ivan\", :score 85}
+        {:id 2, :name \"Oleg\", :score 92}
+        {:id 3, :name \"Petr\", :score 68}])
+
+   One can use:
+
+     (hsql/format
+      (recordset rs
+                 {'id    {:type :int}
+                  'name  {:as 'full-name}
+                  'score {:type :int}}))
+
+   To get to:
+
+     SELECT id, name AS full_name, score
+       FROM JSONB_TO_RECORDSET(CAST(? AS JSONB))
+         AS (id int, name text, score int)"
+  [rs cols]
+  {:select (for [[col-name {:keys [as]}] cols]
+             (if as
+               [col-name as]
+               col-name))
+   :from   [[[:jsonb_to_recordset [:cast (->json rs) :jsonb]]
+             [[:raw (str "("
+                         (string/join ", "
+                                      (for [[col-name {:keys [type]}] cols]
+                                        (str (name col-name) " " (name (or type "text")))))
+                         ")")]]]]})
+
+(defn format-preprocess [sql]
+  (let [re   #"\?[\p{Alpha}*!_?$%&=<>.|''\-+#:0-9]+"
+        args (re-seq re sql)]
+    [(string/replace sql re "?") args]))
+
+(defn format-get [params name]
+  (or
+   (get params name)
+   (throw (ex-info (str "Missing parameter: " name) {:params params}))))
+
+(defmacro format
+  "Given SQL string with named placeholders (\"?symbol\") and map of values,
+   returns [query params...] with positional placeholders.
+
+     (sql/format
+       \"SELECT * FROM triples
+          WHERE attr_id = ?attr-id
+            AND app_id  = ?app-id\"
+       {\"?attr-id\" #uuid ...
+        \"?app-id\"  #uuid ...})
+
+    => [\"SELECT * FROM triples WHERE attr_id = ? and app_id = ?\" #uuid ... #uuid ...]"
+  [sql params]
+  (if (string? sql)
+    ;; if string is statically known, we can preprocess it
+    (let [[sql' param-names] (format-preprocess sql)
+          params-sym (gensym "params")]
+      `(let [~params-sym ~params]
+         [~sql' ~@(map #(list `format-get params-sym %) param-names)]))
+    `(let [params# ~params
+           [sql'# param-names#] (format-preprocess ~sql)]
+       (into [sql'#] (map #(format-get params# %) param-names#)))))
 
 (defn span-attrs-from-conn-pool [conn]
   (when (instance? HikariDataSource conn)
@@ -119,18 +267,25 @@
    the pool (e.g. datalog/query batching).
    Binds *conn-pool-span-stats* at call time to be consistent with calling e.g.
    `select` with the conn-pool directly."
-  [[conn-name ^HikariDataSource conn-pool] & body]
+  [[conn-name ^DataSource conn-pool] & body]
   `(binding [*conn-pool-span-stats* (span-attrs-from-conn-pool ~conn-pool)]
      (io/tag-io
        (with-open [~conn-name (.getConnection ~conn-pool)]
          ~@body))))
 
-(defn- span-attrs [conn query tag]
+(defn- postgres-config-span-attrs [postgres-config]
+  (reduce (fn [acc {:keys [setting value]}]
+            (assoc acc (str "postgres-config." setting) value))
+          {}
+          postgres-config))
+
+(defn- span-attrs [conn query tag additional-opts]
   (let [pool-stats (if (instance? HikariDataSource conn)
                      (span-attrs-from-conn-pool conn)
                      *conn-pool-span-stats*)]
     (merge {:detailed-query (pr-str query)}
            pool-stats
+           (postgres-config-span-attrs (:postgres-config additional-opts))
            (when tag
              {:query-tag tag}))))
 
@@ -167,8 +322,22 @@
                (when remove (remove rw cancelable)))
      :stmts stmts}))
 
-(defn cancel-in-progress [stmts]
-  (doseq [stmt stmts]
+(defn make-top-level-statement-tracker
+  "Creates a statement tracker that ignores all intermediate trackers, except
+   for the top-level default tracker."
+  []
+  (let [{:keys [add remove]} default-statement-tracker
+        stmts (atom #{})]
+    {:add (fn [rw cancelable]
+            (swap! stmts conj cancelable)
+            (when add (add rw cancelable)))
+     :remove (fn [rw cancelable]
+               (swap! stmts disj cancelable)
+               (when remove (remove rw cancelable)))
+     :stmts stmts}))
+
+(defn cancel-in-progress [{:keys [stmts]}]
+  (doseq [stmt @stmts]
     (cancel stmt)))
 
 (defn register-in-progress
@@ -198,29 +367,91 @@
       (close [_]
         nil))))
 
+(defn annotate-query-with-debug-info [query]
+  (if-let [{:keys [span-id trace-id]} (tracer/current-span-ids)]
+    (update query 0 (fn [s]
+                      (let [debug-info (str "-- trace-id=" trace-id
+                                            ", span-id=" span-id
+                                            "\n")]
+                        (if-not (string/starts-with? s "/*+")
+                          (str debug-info s)
+                          (let [end-comment (or (when-let [i (string/index-of s "*/")]
+                                                  (+ i 2))
+                                                (count s))]
+                            (str (subs s 0 end-comment)
+                                 (subs s end-comment)))))))
+    query))
+
+(defn apply-postgres-config [postgres-config created-connection? ^Connection c]
+  (when (seq postgres-config)
+    (cond (not created-connection?)
+          (tracer/record-exception-span!
+           (Exception. "Tried to provide postgres-config for a connection we didn't create")
+           {:name "sql/apply-postgres-config-error"
+            :attributes (postgres-config-span-attrs postgres-config)})
+
+          (.getAutoCommit c)
+          (tracer/record-exception-span!
+           (Exception. "Tried to provide postgres-config for a connection with auto-commit = on")
+           {:name "sql/apply-postgres-config-error"
+            :attributes (postgres-config-span-attrs postgres-config)})
+
+          :else
+          (try
+            (tracer/with-span! {:name "sql/apply-postgres-config"
+                                :attributes (postgres-config-span-attrs postgres-config)}
+              (next-jdbc/execute!
+               c
+               (hsql/format {:with [[[:t {:columns [:setting :value]}]
+                                     {:values (map (fn [{:keys [setting value]}]
+                                                     [setting value])
+                                                   postgres-config)}]]
+                             :select [[[:set_config :t.setting :t.value true]]]
+                             :from :t})))
+            (catch Exception _ nil)))))
+
+(defn annotate-update-count [^PreparedStatement ps]
+  (try
+    (let [update-count (.getUpdateCount ps)]
+      (when (not= -1 update-count)
+        (tracer/add-data! {:attributes
+                           {:update-count update-count}})))
+    (catch Throwable _e nil)))
+
 (defmacro defsql [name query-fn rw opts]
-  (let [span-name (format "sql/%s" name)]
+  (let [span-name (clojure.core/format "sql/%s" name)]
     `(defn ~name
        ([~'conn ~'query]
-        (~name nil ~'conn ~'query))
-       ([~'tag ~'conn ~'query]
         (~name nil ~'conn ~'query nil))
+       ([~'tag ~'conn ~'query]
+        (~name ~'tag ~'conn ~'query nil))
        ([~'tag ~'conn ~'query ~'additional-opts]
         (tracer/with-span! {:name ~span-name
-                            :attributes (span-attrs ~'conn ~'query ~'tag)}
+                            :attributes (span-attrs ~'conn ~'query ~'tag ~'additional-opts)}
+          ;; Uncomment to send sql queries to portal
+          ;; (tap> (with-meta ~'query
+          ;;         {:portal.viewer/default :tool/sql-query}))
           (try
             (io/tag-io
-              (let [create-connection?# (not (instance? Connection ~'conn))
+              (let [postgres-config# (:postgres-config ~'additional-opts)
+                    create-connection?# (not (instance? Connection ~'conn))
                     opts# (merge ~opts
-                                 ~'additional-opts
+                                 (dissoc ~'additional-opts :postgres-config)
                                  {:timeout *query-timeout-seconds*})
                     ^Connection c# (if create-connection?#
                                      (next-jdbc/get-connection ~'conn)
-                                     ~'conn)]
+                                     ~'conn)
+
+                    query# (annotate-query-with-debug-info ~'query)]
                 (try
-                  (with-open [ps# (next-jdbc/prepare c# ~'query opts#)
+                  (apply-postgres-config postgres-config# create-connection?# c#)
+                  (with-open [ps# (next-jdbc/prepare c# query# opts#)
                               _cleanup# (register-in-progress create-connection?# ~rw c# ps#)]
-                    (~query-fn ps# nil opts#))
+                    (let [res# (~query-fn ps# nil opts#)]
+                      (annotate-update-count ps#)
+                      (if (:attach-warnings? opts#)
+                        (with-meta res# {:warnings (.getWarnings ps#)})
+                        res#)))
                   (finally
                     ;; Don't close the connection if a java.sql.Connection was
                     ;; passed in, or we'll end transactions before they're done.
@@ -240,19 +471,14 @@
                                                     :return-keys true})
 (defsql do-execute! next-jdbc/execute! :write {:return-keys false})
 
-(defn patch-hikari []
-  ;; Hikari will send an extra query to ensure the connection is valid
-  ;; if it has been idle for half a second. This raises the limit so
-  ;; that it only checks every minute.
-  ;; This shouldn't be necessary at all--the connection should be able
-  ;; to tell when it's closed. But even if it can't tell if it's closed,
-  ;; the connection pool should use the query you want to send as the
-  ;; validation check. If it gets a retryable error, like connection_closed,
-  ;; then it can try again on another connection.
-  (System/setProperty "com.zaxxer.hikari.aliveBypassWindowMs" "60000"))
+(defn analyze [conn query]
+  (-> query
+      (update 0 #(str "EXPLAIN ANALYZE " %))
+      (->> (execute! conn)
+           (mapcat vals)
+           (string/join "\n"))))
 
-(defn start-pool [config]
-  (patch-hikari)
+(defn start-pool ^HikariDataSource [config]
   (let [url (connection/jdbc-url config)
         pool (connection/->pool HikariDataSource (assoc config :jdbcUrl url))]
     (.close (next-jdbc/get-connection pool))

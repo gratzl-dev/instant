@@ -6,9 +6,8 @@
             [instant.util.json :as json]
             [instant.util.uuid :as uuid-util]
             [instant.jdbc.aurora :as aurora]
-            [instant.data.constants :refer [zeneca-app-id]]
-            [instant.db.model.triple :as triple-model])
-  (:import (java.time Instant)))
+            [instant.db.model.triple :as triple-model]
+            [instant.comment :as c]))
 
 (s/def ::attr-pat
   (s/cat :e (d/pattern-component uuid?)
@@ -34,19 +33,27 @@
            checking-data-type?]}
    v-actualized?]
   (let [ref? (= value-type :ref)
-        e-idx (if ref? :eav :ea)
+        e-idx (if ref? :vae :ea)
         v-idx (cond
+                ref? :vae
+
                 (and index?
                      (not indexing?)
                      checked-data-type
-                     (not checking-data-type?)) {:idx-key :ave
-                                                 :data-type checked-data-type}
+                     (not checking-data-type?))
+                {:idx-key :ave
+                 :data-type checked-data-type}
+
                 (and unique? (not setting-unique?)) :av
                 (and index? (not indexing?)) :ave
-                ref? :vae
+
                 :else :ea ;; this means we are searching over an unindexed blob attr
                 )]
     (if v-actualized? v-idx e-idx)))
+
+(defn constant-component? [component]
+  (and (not (symbol? component))
+       (not (:$isNull component))))
 
 (defn component-actualized?
   "A component is actualized if:
@@ -57,7 +64,7 @@
     [?bookshelves books-attr ?books]] ;; ?bookshelves is actualized (it's been bound)
   "
   [seen component]
-  (or (d/constant? component)
+  (or (constant-component? component)
       (seen component)))
 
 (defn attr-by-id
@@ -268,13 +275,13 @@
                (throw-invalid-data-value! state attr data-type v))
     :date (cond (number? v)
                 (try
-                  (Instant/ofEpochMilli v)
+                  (triple-model/parse-date-value v)
                   (catch Exception _e
                     (throw-invalid-timestamp! state attr v)))
 
                 (string? v)
                 (try
-                  (Instant/parse v)
+                  (triple-model/parse-date-value v)
                   (catch Exception _e
                     (throw-invalid-date-string! state attr v)))
 
@@ -298,11 +305,11 @@
   (case attr-data-type
     :date (case tag
             :number (try
-                      (Instant/ofEpochMilli value)
+                      (triple-model/parse-date-value value)
                       (catch Exception _e
                         (throw-invalid-timestamp! state attr value)))
             :string (try
-                      (Instant/parse value)
+                      (triple-model/parse-date-value value)
                       (catch Exception _e
                         (throw-invalid-date-string! state attr value))))
     (if-not (= tag attr-data-type)
@@ -343,7 +350,10 @@
         :else
         (if (and (:checked-data-type attr)
                  (not (:checking-data-type? attr)))
-          (coerced-value-with-checked-type! state attr (:checked-data-type attr) v)
+          (let [coerced (coerced-value-with-checked-type! state attr (:checked-data-type attr) v)]
+            (if (:index? attr)
+              coerced
+              v))
           v)))
 
 (defn ->value-attr-pat
@@ -441,9 +451,11 @@
   (:pats (attr-pats->patterns-impl ctx #{} attr-pats)))
 
 (comment
-  (def attrs (attr-model/get-by-app-id zeneca-app-id))
-  (def ctx {:db {:conn-pool (aurora/conn-pool)}
-            :app-id zeneca-app-id
+  (def z (c/zeneca-app!))
+  (def z-id (:id z))
+  (def attrs (attr-model/get-by-app-id z-id))
+  (def ctx {:db {:conn-pool (aurora/conn-pool :read)}
+            :app-id z-id
             :datalog-query-fn #'d/query
             :attrs attrs})
   (attr-pats->patterns

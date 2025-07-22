@@ -5,11 +5,29 @@ dev:
 	@echo "Booting up frontend..."
 	pnpm run dev
 
-index-docs:
-	@echo "Indexing docs..."
-	node ./www/scripts/index-docs.mjs
+lint:
+	pnpm run check-format
+
+lint-fix:
+	pnpm run check-format --write
+
+index-docs-dry-run:
+	@echo "Dry run..."
+	pnpm exec tsx ./www/scripts/index-docs.ts --dry-run
+
+index-docs-manual:
+	@echo "Manual indexing..."
+	pnpm exec tsx ./www/scripts/index-docs.ts
 
 publish:
+	@echo "There is a new way to publish packages!"
+	@echo "1. Create a new branch and update the version.md with your new version."
+	@echo "2. Open a PR with that branch."
+	@echo "3. Wait for the GitHub actions to publish the packages and add a commit to the branch"
+	@echo "4. Merge your branch."
+	@echo "If you absolutely need to publish manually, run make publish-ci"
+
+publish-ci:
 	@echo "Building + Publishing Packages..."
 	./scripts/publish_packages.clj
 
@@ -24,7 +42,6 @@ build-email:
 
 replace-email-images:
 	echo "Replacing images..."
-	cd www/_emails/replace-images && pnpm i
 	node www/_emails/replace-images/index.mjs $(slug)
 
 text-email:

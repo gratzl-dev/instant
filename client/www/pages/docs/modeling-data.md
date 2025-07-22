@@ -1,5 +1,6 @@
 ---
 title: Modeling data
+description: How to model data with Instant's schema.
 ---
 
 In this section we’ll learn how to model data using Instant's schema. By the end of this document you’ll know how to:
@@ -30,7 +31,7 @@ Open `instant.schema.ts`, and paste the following:
 ```typescript {% showCopy=true %}
 // instant.schema.ts
 
-import { i } from "@instantdb/core";
+import { i } from '@instantdb/react';
 
 const _schema = i.schema({
   entities: {
@@ -56,24 +57,24 @@ const _schema = i.schema({
   },
   links: {
     postAuthor: {
-      forward: { on: "posts", has: "one", label: "author" },
-      reverse: { on: "profiles", has: "many", label: "authoredPosts" },
+      forward: { on: 'posts', has: 'one', label: 'author' },
+      reverse: { on: 'profiles', has: 'many', label: 'authoredPosts' },
     },
     commentPost: {
-      forward: { on: "comments", has: "one", label: "post" },
-      reverse: { on: "posts", has: "many", label: "comments" },
+      forward: { on: 'comments', has: 'one', label: 'post' },
+      reverse: { on: 'posts', has: 'many', label: 'comments' },
     },
     commentAuthor: {
-      forward: { on: "comments", has: "one", label: "author" },
-      reverse: { on: "profiles", has: "many", label: "authoredComments" },
+      forward: { on: 'comments', has: 'one', label: 'author' },
+      reverse: { on: 'profiles', has: 'many', label: 'authoredComments' },
     },
     postsTags: {
-      forward: { on: "posts", has: "many", label: "tags" },
-      reverse: { on: "tags", has: "many", label: "posts" },
+      forward: { on: 'posts', has: 'many', label: 'tags' },
+      reverse: { on: 'tags', has: 'many', label: 'posts' },
     },
     profileUser: {
-      forward: { on: "profiles", has: "one", label: "$user" },
-      reverse: { on: "$users", has: "one", label: "profile" },
+      forward: { on: 'profiles', has: 'one', label: '$user' },
+      reverse: { on: '$users', has: 'one', label: 'profile' },
     },
   },
 });
@@ -153,6 +154,70 @@ const _schema = i.schema({
 ```
 
 Instant will _make sure_ that all `title` attributes are strings, and you'll get the proper typescript hints to boot!
+
+### Required constraints
+
+All attributes you define are considered _required_ by default. This constraint is enforced on the backend: Instant guarantees that every entity of that type will have a value and reports errors if you attempt to add an entity without a required attribute.
+
+```typescript
+const _schema = i.schema({
+  entities: {
+    posts: i.entity({
+      title: i.string(), // <-- required
+      published: i.date(), // <-- required
+    }),
+  },
+});
+
+db.transact(
+  db.tx.posts[id()].update({
+    title: 'abc', // <-- no published -- will throw
+  }),
+);
+```
+
+You can mark attribute as optional by calling `.optional()`:
+
+```typescript
+const _schema = i.schema({
+  entities: {
+    posts: i.entity({
+      title: i.string(), // <-- required
+      published: i.date().optional(), // <-- optional
+    }),
+  },
+});
+
+db.transact(
+  db.tx.posts[id()].update({
+    title: 'abc', // <-- no published -- still okay
+  }),
+);
+```
+
+This will also reflect in types: query results containing `posts` will show `title: string` (non-nullable) and `published: string | number | null` (nullable).
+
+You can set required on forward links, too:
+
+```typescript
+postAuthor: {
+  forward: { on: 'posts', has: 'one', label: 'author', required: true },
+  reverse: { on: 'profiles', has: 'many', label: 'authoredPosts' },
+},
+```
+
+Finally, for legacy attributes that are treated as required on your front-end but you are not ready to enable back-end required checks yet, you can use `.clientRequired()`. That will produce TypeScript type without `null` but will not add back-end required check:
+
+```typescript
+const _schema = i.schema({
+  entities: {
+    posts: i.entity({
+      title: i.string().clientRequired(),
+      published: i.date().optional(),
+    }),
+  },
+});
+```
 
 ### Unique constraints
 
@@ -264,6 +329,31 @@ Our micro-blog example has the following relationship types:
 - **One-to-many** between `comments` and `profiles`
 - **Many-to-many** between `posts` and `tags`
 
+### Cascade Delete
+
+Links defined with `has: "one"` can set `onDelete: "cascade"`. In this case, when the profile entity is deleted, all post entities will be deleted too:
+
+```typescript
+postAuthor: {
+  forward: { on: "posts", has: "one", label: "author", onDelete: "cascade" },
+  reverse: { on: "profiles", has: "many", label: "authoredPosts" },
+}
+
+// this will delete profile and all linked posts
+db.tx.profiles[user_id].delete();
+```
+
+Without `onDelete: "cascade"`, deleting a profile would simply delete the links but not delete the underlying posts.
+
+If you prefer to model links in other direction, you can do it, too:
+
+```
+postAuthor: {
+  forward: { on: "profiles", has: "many", label: "authoredPosts" },
+  reverse: { on: "posts", has: "one", label: "author", onDelete: "cascade" },
+}
+```
+
 ## Publishing your schema
 
 Now that you have your schema, you can use the CLI to `push` it to your app:
@@ -321,7 +411,7 @@ const db = init({
 });
 ```
 
-When you do this, all [queries](/docs/instaql) and [transactions](/docs/instaql) will come with typesafety out of the box.
+When you do this, all [queries](/docs/instaql) and [transactions](/docs/instaml) will come with typesafety out of the box.
 
 {% callout %}
 
@@ -395,7 +485,6 @@ The following changes will be applied to your perms:
 {% /ansi %}
 
 You'll still be able to make changes in the explorer or with the CLI, but client-side transactions that try to modify your schema will fail. This means your schema is safe from unwanted changes!
-
 
 ---
 

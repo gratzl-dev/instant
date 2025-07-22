@@ -8,7 +8,7 @@ import {
   type LinksDef,
   type RoomsDef,
   type UnknownRooms,
-} from "./schemaTypes";
+} from './schemaTypes.ts';
 
 // ==========
 // API
@@ -66,29 +66,30 @@ function entity<Attrs extends AttrsDefs>(
 
 function string<StringEnum extends string = string>(): DataAttrDef<
   StringEnum,
-  true
+  true,
+  false
 > {
-  return new DataAttrDef("string", true);
+  return new DataAttrDef('string', true, false);
 }
 
-function number(): DataAttrDef<number, true> {
-  return new DataAttrDef("number", true);
+function number(): DataAttrDef<number, true, false> {
+  return new DataAttrDef('number', true, false);
 }
 
-function boolean(): DataAttrDef<boolean, true> {
-  return new DataAttrDef("boolean", true);
+function boolean(): DataAttrDef<boolean, true, false> {
+  return new DataAttrDef('boolean', true, false);
 }
 
-function date(): DataAttrDef<string | number, true> {
-  return new DataAttrDef("date", true);
+function date(): DataAttrDef<string | number, true, false> {
+  return new DataAttrDef('date', true, false);
 }
 
-function json<T = any>(): DataAttrDef<T, true> {
-  return new DataAttrDef("json", true);
+function json<T = any>(): DataAttrDef<T, true, false> {
+  return new DataAttrDef('json', true, false);
 }
 
-function any(): DataAttrDef<any, true> {
-  return new DataAttrDef("json", true);
+function any(): DataAttrDef<any, true, false> {
+  return new DataAttrDef('json', true, false);
 }
 
 // ==========
@@ -130,7 +131,7 @@ function enrichEntitiesWithLinks<
 }
 
 type LinksIndex = Record<
-  "fwd" | "rev",
+  'fwd' | 'rev',
   Record<string, Record<string, { entityName: string; cardinality: string }>>
 >;
 
@@ -164,8 +165,8 @@ function schema<
   links?: Links;
   rooms?: Rooms;
 }) {
-  const linksDef = links ?? {} as Links;
-  const roomsDef = rooms ?? {} as Rooms;
+  const linksDef = links ?? ({} as Links);
+  const roomsDef = rooms ?? ({} as Rooms);
   return new InstantSchemaDef(
     enrichEntitiesWithLinks<EntitiesWithoutLinks, Links>(entities, linksDef),
     // (XXX): LinksDef<any> stems from TypeScript’s inability to reconcile the

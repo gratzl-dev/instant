@@ -29,8 +29,8 @@ export function Dev() {
         Object.keys(flags).map((k) => [
           k,
           getLocal(`__instant__flag__${k}`) ?? false,
-        ])
-      )
+        ]),
+      ),
     );
 
     document.addEventListener('keydown', toggleOpen);
@@ -128,14 +128,14 @@ export function Dev() {
                     className="bg-black text-white py-0.5 px-2"
                     onClick={() => {
                       const nextTokens = authTokens.filter(
-                        (t) => t.token !== p.token
+                        (t) => t.token !== p.token,
                       );
 
                       setAuthTokens(nextTokens);
 
                       localStorage.setItem(
                         '__instant__authTokens',
-                        JSON.stringify(nextTokens)
+                        JSON.stringify(nextTokens),
                       );
                     }}
                   >
@@ -159,7 +159,8 @@ export function Dev() {
               onClick={() => {
                 setToken(undefined);
                 location.reload();
-              }}>
+              }}
+            >
               Clear
             </button>
           </div>
@@ -196,7 +197,7 @@ export function Dev() {
 
               localStorage.setItem(
                 '__instant__authTokens',
-                JSON.stringify(nextTokens)
+                JSON.stringify(nextTokens),
               );
             }}
           >
@@ -236,7 +237,7 @@ export function Dev() {
                   token,
                   prod,
                 },
-              ])
+              ]),
             );
 
             setTokenAndReload(token);
@@ -272,7 +273,7 @@ function setToken(token?: string) {
       '@AUTH',
       JSON.stringify({
         token,
-      })
+      }),
     );
   } else {
     localStorage.removeItem('@AUTH');

@@ -9,6 +9,8 @@ import { DocsPage } from '@/components/DocsPage';
 import { Button } from '@/components/ui';
 import { isDev } from '@/lib/config';
 import { Dev } from '@/components/Dev';
+import patchFirefoxClicks from '@/lib/patchFirefoxClicks';
+import { useEffect } from 'react';
 
 declare global {
   function __getAppId(): any;
@@ -19,8 +21,8 @@ declare global {
 // hack to pass app ID to examples pages
 globalThis.__getAppId = () =>
   typeof window !== 'undefined'
-    ? new URL(location.href).searchParams.get('__appId') ??
-    localStorage.getItem('examples-appId')
+    ? (new URL(location.href).searchParams.get('__appId') ??
+      localStorage.getItem('examples-appId'))
     : undefined;
 
 function App({ Component, pageProps }: AppProps) {
@@ -30,7 +32,9 @@ function App({ Component, pageProps }: AppProps) {
   ) : (
     <Component {...pageProps} />
   );
-
+  useEffect(() => {
+    return patchFirefoxClicks();
+  }, []);
   return (
     <>
       <AppHead />
@@ -140,17 +144,9 @@ function AppHead() {
         content="width=device-width, initial-scale=1, maximum-scale=1"
       />
       <meta name="theme-color" content="#ffffff" />
-      <meta property="og:type" content="website" />
-      <meta property="og:url" content="https://www.instantdb.com" />
+      <meta key="og:type" property="og:type" content="website" />
       <meta
-        property="og:title"
-        content="InstantDB: A Modern Firebase"
-      />
-      <meta
-        property="og:description"
-        content="We make you productive by giving your frontend a real-time database."
-      />
-      <meta
+        key="og:image"
         property="og:image"
         content="https://www.instantdb.com/img/og_preview.png"
       />

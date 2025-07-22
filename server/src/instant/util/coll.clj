@@ -24,6 +24,15 @@
                not-found))
            not-found coll)))
 
+(defn exists?
+  "Returns true if any item in the coll matches (pred item), otherwise false."
+  [pred coll]
+  (reduce (fn [acc x]
+            (if (pred x)
+              (reduced true)
+              acc))
+          false coll))
+
 (defn pad [n val coll]
   (let [cnt (- n (count coll))]
     (concat coll (repeat cnt val))))
@@ -58,6 +67,7 @@
   (by-index x :ident [:users :post]))
 
 (def ^:private not-found (Object.))
+
 (defn update-in-when
   "Like update-in, but only updates when `ks` is present"
   [m ks f & args]
@@ -65,6 +75,14 @@
     (if (identical? old-v not-found)
       m
       (assoc-in m ks (apply f old-v args)))))
+
+(defn update-when
+  "Like update, but only updates when `k` is present"
+  [m k f & args]
+  (let [old-v (get m k not-found)]
+    (if (identical? old-v not-found)
+      m
+      (assoc m k (apply f old-v args)))))
 
 (comment
   (update-in-when {:a {:b 1}} [:a :b] + 1)
@@ -114,7 +132,6 @@
 
                      :else (throw (IllegalArgumentException.
                                    "ns-prefix must be a string or keyword")))
-        _         (println ns-str)
         ns-keys (filter #(= (namespace %) ns-str) (keys m))
         remove-ns (fn [[k v]] [(keyword (name k)) v])]
     (into (with-meta {} (meta m))
@@ -128,13 +145,27 @@
   ;; => {:b 1}
   )
 
+(defn split-map-by-namespace
+  "Splits a map into multiple maps by the namespace of each key.
+   Only handles a single level.
+   Example:
+     {:a/b 1 :a/c 2, :d/e 3 :d/f 4 :g 5}
+       -> {:a {:b 1 :c 2} :d {:e 3 :f 4} nil {:g 5}}"
+  [m]
+  (when m
+    (reduce-kv (fn [acc k v]
+                 (if-not (keyword? k)
+                   (assoc-in acc [nil k] v)
+                   (assoc-in acc [(keyword (namespace k)) (keyword (name k))] v)))
+               (empty {})
+               m)))
+
 (defmacro array-of
   [klass vals]
   (let [^Class resolved (resolve klass)]
     (with-meta
       (list 'into-array resolved vals)
       {:tag (str "[L" (.getName resolved) ";")})))
-
 
 (defn third
   "Returns the third element in a collection."
@@ -150,8 +181,68 @@
           {}
           m))
 
+(defn map-keys
+  "Apply `f` to keys of `m`"
+  [f m]
+  (persistent!
+   (reduce-kv
+    (fn [m k v]
+      (assoc! m (f k) v))
+    (transient (empty m)) m)))
+
+(defn filter-keys
+  "Only keep keys in `m` that return truthy for `(pred key)`"
+  [pred m]
+  (persistent!
+   (reduce-kv
+    (fn [m key _]
+      (if (pred key)
+        m
+        (dissoc! m key)))
+    (transient m) m)))
+
 (defn every?-var-args [pred & colls]
   (if (= 1 (count colls))
     (every? pred (first colls))
     (every? (fn [args] (apply pred args))
             (apply map vector colls))))
+
+(defn split-by
+  "Returns [(filter pred xs) (remove pred xs)]"
+  [pred xs]
+  (let [[f r] (reduce
+               (fn [[f r] x]
+                 (if (pred x)
+                   [(conj! f x) r]
+                   [f (conj! r x)]))
+               [(transient []) (transient [])] xs)]
+    [(persistent! f) (persistent! r)]))
+
+(defn map-by
+  "Given xs, builds a map of {(key-fn x) x}"
+  [key-fn xs]
+  (persistent!
+   (reduce
+    (fn [m x]
+      (assoc! m (key-fn x) x))
+    (transient {}) xs)))
+
+(defn group-by-to
+  "Like group-by but applies (val-fn x) to values"
+  ([key-fn val-fn xs]
+   (group-by-to key-fn val-fn [] xs))
+  ([key-fn val-fn container xs]
+   (persistent!
+    (reduce
+     (fn [m x]
+       (let [k (key-fn x)
+             v (val-fn x)
+             old-v (get m k container)]
+         (assoc! m k (conj old-v v))))
+     (transient {}) xs))))
+
+(defn reduce-tr
+  "Like reduce but makes acc transient/persistent automatically"
+  [f init xs]
+  (persistent!
+   (reduce f (transient init) xs)))

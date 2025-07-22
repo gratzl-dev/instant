@@ -4,7 +4,7 @@ DC = $(shell command -v docker-compose >/dev/null 2>&1 && echo "docker-compose" 
 
 dev:
 	@echo "Booting up backend w/ local db..."
-	clojure -M:dev:run
+	clojure -T:build dev
 
 bootstrap-oss:
 	clojure -X:dev:oss-bootstrap
@@ -13,7 +13,11 @@ dev-oss:
 	@echo "Booting up backend w/ local db..."
 	clojure -X:dev:oss-bootstrap
 	@echo "Starting server..."
-	clojure -M:dev:run
+	clojure -T:build dev
+
+install-hooks:
+	@echo "Installing .git/hooks/pre-commit..."
+	ln -f -s ../../server/dev-resources/hooks/pre-commit ../.git/hooks/pre-commit
 
 docker-compose:
 	$(DC) -f ./docker-compose-dev.yml build && $(DC) -f ./docker-compose-dev.yml up
@@ -26,15 +30,20 @@ dev-down:
 	@echo "Migrating dev db up down by 1"
 	migrate -database "postgresql://localhost:5432/instant?sslmode=disable" -path resources/migrations down 1
 
-dev-storm:
-	@echo "Booting up dev with storm debugger..."
-	@echo "Usage:"
-	@echo " user> (require '[flow-storm.api :as fs-api])"
-	@echo " user> (fs-api/local-connect)"
-	clojure -M:dev:storm:run
+## Generates the blank up/down files for the migration
+# Update -digits to 3 when we hit migration 100
+create-migration:
+	@read -p "Enter the migration name: " name; \
+	migrate create -dir resources/migrations -ext sql -digits 2 -seq "$$name"
+
+compile-java:
+	clojure -T:build compile-java
 
 test:
 	TEST=true clojure -M:test
+
+test+:
+	TEST=true clojure -X:test instant.test-core/-main+
 
 retest:
 	TEST=true clojure -M:retest
@@ -52,7 +61,7 @@ restart:
 dev-with-prod-db:
 	@DATABASE_URL=$$(./scripts/prod_connection_string.sh); \
 	echo "[IMPORTANT] Booting up backend w/ prod db..." && \
-	DATABASE_URL="$${DATABASE_URL}" clj -M:dev:run
+	DATABASE_URL="$${DATABASE_URL}" clj -T:build dev
 
 prod-ssh:
 	./scripts/prod_ssh.sh
@@ -65,21 +74,19 @@ prod-connect:
 
 prod-version:
 	@DATABASE_URL=$$(./scripts/prod_connection_string.sh); \
-	echo "Checking prod db version... [y/N]" && \
-		read ans && [ $$ans = y ] && \
-	migrate -database "$${DATABASE_URL}" -path resources/migrations version
+	migrate -database "$${DATABASE_URL}" -source github://instantdb/instant/server/resources/migrations#main version
 
 prod-up:
 	@DATABASE_URL=$$(./scripts/prod_connection_string.sh); \
 	echo "[IMPORTANT] Migrating prod up to latest -- are you sure you want to do this? [y/N]" && \
 		read ans && [ $$ans = y ] && \
-		migrate -database "$${DATABASE_URL}" -path resources/migrations up
+		migrate -database "$${DATABASE_URL}" -source github://instantdb/instant/server/resources/migrations#main up
 
 prod-down:
 	@DATABASE_URL=$$(./scripts/prod_connection_string.sh); \
 	echo "[IMPORTANT] Migrating prod db down by 1 -- are you sure you want to do this? [y/N]" && \
 		read ans && [ $$ans = y ] && \
-		migrate -database "$${DATABASE_URL}" -path resources/migrations down 1
+		migrate -database "$${DATABASE_URL}" -source github://instantdb/instant/server/resources/migrations#main down 1
 
 psql:
 	@echo "Connecting to local db..."
@@ -95,6 +102,12 @@ psql-dump:
 	@DATABASE_URL=$$(./scripts/prod_connection_string.sh); \
 	echo "Exporting prod db..." && \
 	pg_dump "$${DATABASE_URL}" -f dump.sql
+
+psql-dump-dir:
+	@DATABASE_URL=$$(./scripts/prod_connection_string.sh); \
+	echo "Exporting prod db..." && \
+	pg_dump "$${DATABASE_URL}" -F d -j 8 --compress=zstd:3 -f dump-dir && \
+	echo "Import with \`pg_restore -d LOCAL_DB -j 8 dump-dir\`"
 
 psql-dump-schema:
 	@DATABASE_URL=$$(./scripts/prod_connection_string.sh); \
@@ -121,5 +134,8 @@ encrypt-secret-dev:
 encrypt-secret-prod:
 	clj -X:encrypt-secret :env :prod
 
+encrypt-secret-staging:
+	clj -X:encrypt-secret :env :staging
+
 lint:
-	clojure -M:lint
+	if command -v clj-kondo >/dev/null 2>&1; then clj-kondo --lint src test; else clojure -M:lint; fi

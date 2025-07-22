@@ -1,16 +1,16 @@
 {
-  "name": "vanilla-js-vite",
+  "name": "sandbox/vanilla-js-vite",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --clearScreen false",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },
   "devDependencies": {
     "@types/google.accounts": "^0.0.14",
-    "typescript": "^5.5.4",
+    "typescript": "^5.8.3",
     "vite": "^5.2.0"
   },
   "dependencies": {

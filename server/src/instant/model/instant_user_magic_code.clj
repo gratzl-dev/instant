@@ -8,13 +8,13 @@
   (:import
    (java.time Instant)
    (java.time.temporal ChronoUnit)
-   (java.util UUID)))
+   (java.util Date UUID)))
 
 (defn rand-code []
   (rand-num-str 6))
 
 (defn create!
-  ([params] (create! (aurora/conn-pool) params))
+  ([params] (create! (aurora/conn-pool :write) params))
   ([conn {:keys [id code user-id]}]
    (sql/execute-one! conn
                      ["INSERT INTO instant_user_magic_codes (id, code, user_id) VALUES (?::uuid, ?, ?::uuid)"
@@ -23,10 +23,10 @@
 (defn expired?
   ([magic-code] (expired? (Instant/now) magic-code))
   ([now {created-at :created_at}]
-   (> (.between ChronoUnit/HOURS (.toInstant created-at) now) 24)))
+   (> (.between ChronoUnit/HOURS (Date/.toInstant created-at) now) 24)))
 
 (defn consume!
-  ([params] (consume! (aurora/conn-pool) params))
+  ([params] (consume! (aurora/conn-pool :write) params))
   ([conn {:keys [email code] :as params}]
    (let [m (sql/execute-one! conn
                              ["DELETE FROM instant_user_magic_codes

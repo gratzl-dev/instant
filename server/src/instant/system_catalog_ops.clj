@@ -59,25 +59,47 @@
                           k)]
                   (cond-> acc
                     true (assoc k v)
-                    (= k :id) (assoc :created_at (Date. t)))))))
+                    (= k :id) (assoc :created_at (Date. (long t))))))))
           {:app_id app-id}
           triples))
 
 (defn delete-entity!
   "Deletes and returns the deleted entity (if it was deleted)."
-  [tx-conn attrs app-id etype lookup]
+  [tx-conn attrs app-id etype lookup opts]
   (some->> (tx/transact-without-tx-conn! tx-conn
                                          attrs
                                          app-id
-                                         [[:delete-entity lookup etype]])
+                                         [[:delete-entity lookup etype]]
+                                         opts)
            :results
            :delete-entity
            seq
-           (map (juxt :triples/entity_id
-                      :triples/attr_id
-                      :triples/value
-                      :triples/created_at))
+           (map (juxt :entity_id
+                      :attr_id
+                      :value
+                      :created_at))
            (triples->db-format app-id attrs etype)))
+
+(defn delete-entities!
+  "Deletes and returns entities that were deleted."
+  [tx-conn attrs app-id etype lookups opts]
+  (some->> (tx/transact-without-tx-conn! tx-conn
+                                         attrs
+                                         app-id
+                                         (mapv (fn [lookup]
+                                                 [:delete-entity lookup etype])
+                                               lookups)
+                                         opts)
+           :results
+           :delete-entity
+           seq
+           (map (juxt :entity_id
+                      :attr_id
+                      :value
+                      :created_at))
+           (group-by first)
+           vals
+           (map #(triples->db-format app-id attrs etype %))))
 
 (defn collect-iql-result
   ([iql-res]
@@ -96,12 +118,6 @@
            acc
            iql-res)))
 
-(defn resolve-attr-id [attrs etype label]
-  {:post [(uuid? %)]}
-  (let [n [(name etype) (name label)]]
-    (:id (or (attr-model/seek-by-fwd-ident-name n attrs)
-             (attr-model/seek-by-rev-ident-name n attrs)))))
-
 (defn get-entity [conn app-id attrs etype eid]
   (let [triples (entity-model/get-triples {:app-id app-id
                                            :attrs attrs
@@ -111,6 +127,23 @@
                                           eid)]
     (when (seq triples)
       (triples->db-format app-id attrs etype triples))))
+
+(defn get-entities [conn app-id attrs etype eids]
+  (let [triples (entity-model/get-triples {:app-id app-id
+                                           :attrs attrs
+                                           :datalog-query-fn d/query
+                                           :db {:conn-pool conn}}
+                                          etype
+                                          eids)
+
+        groups (group-by first triples)]
+    (->> eids
+         (map (fn [eid]
+                (let [triples (get groups eid)]
+                  [eid (when (seq triples)
+                         (triples->db-format app-id attrs etype triples))])))
+
+         (into {}))))
 
 (defn get-entity-where [conn app-id attrs etype where]
   (let [iql-res (i/query {:app-id app-id
@@ -161,18 +194,34 @@
     (let [attrs (attr-model/get-by-app-id tx-conn app-id)]
       (op
        {:resolve-id
-        (fn [label] (resolve-attr-id attrs etype label))
+        (fn [label] (attr-model/resolve-attr-id attrs etype label))
 
         :transact!
-        (fn [tx-steps]
-          (tx/transact-without-tx-conn! tx-conn attrs app-id tx-steps))
+        (fn
+          ([tx-steps]
+           (tx/transact-without-tx-conn! tx-conn attrs app-id tx-steps {}))
+          ([tx-steps opts]
+           (tx/transact-without-tx-conn! tx-conn attrs app-id tx-steps opts)))
 
         :delete-entity!
-        (fn [lookup]
-          (delete-entity! tx-conn attrs app-id etype lookup))
+        (fn
+          ([lookup]
+           (delete-entity! tx-conn attrs app-id etype lookup {}))
+          ([lookup opts]
+           (delete-entity! tx-conn attrs app-id etype lookup opts)))
+
+        :delete-entities!
+        (fn
+          ([lookups]
+           (delete-entities! tx-conn attrs app-id etype lookups {}))
+          ([lookups opts]
+           (delete-entities! tx-conn attrs app-id etype lookups opts)))
 
         :get-entity
         (fn [eid] (get-entity tx-conn app-id attrs etype eid))
+
+        :get-entities
+        (fn [eids] (get-entities tx-conn app-id attrs etype eids))
 
         :get-entity-where
         (fn [where] (get-entity-where tx-conn app-id attrs etype where))
@@ -187,10 +236,13 @@
                 op]
   (let [attrs (attr-model/get-by-app-id conn-pool app-id)]
     (op {:resolve-id
-         (fn [label] (resolve-attr-id attrs etype label))
+         (fn [label] (attr-model/resolve-attr-id attrs etype label))
 
          :get-entity
          (fn [eid] (get-entity conn-pool app-id attrs etype eid))
+
+         :get-entities
+         (fn [eids] (get-entities conn-pool app-id attrs etype eids))
 
          :get-entity-where
          (fn [where] (get-entity-where conn-pool app-id attrs etype where))

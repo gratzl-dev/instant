@@ -18,7 +18,6 @@ import {
   type Query,
   type Config,
   type InstaQLParams,
-
   type ConnectionStatus,
 
   // schema types
@@ -35,6 +34,7 @@ import {
   type ResolveAttrs,
   type ValueTypes,
   type InstaQLEntity,
+  type InstaQLFields,
   type InstaQLResult,
   type InstantUnknownSchema,
   type InstantSchemaDef,
@@ -42,12 +42,23 @@ import {
   type InstantRules,
   type UpdateParams,
   type LinkParams,
-} from "@instantdb/core";
+  type ExchangeCodeForTokenParams,
+  type SendMagicCodeParams,
+  type SendMagicCodeResponse,
+  type SignInWithIdTokenParams,
+  type VerifyMagicCodeParams,
+  type VerifyResponse,
 
-import InstantReactAbstractDatabase from "./InstantReactAbstractDatabase";
-import InstantReactWebDatabase from "./InstantReactWebDatabase";
-import { init, init_experimental } from "./init";
-import { Cursors } from "./Cursors";
+  // storage types
+  type FileOpts,
+  type UploadFileResponse,
+  type DeleteFileResponse,
+} from '@instantdb/core';
+
+import InstantReactAbstractDatabase from './InstantReactAbstractDatabase.ts';
+import InstantReactWebDatabase from './InstantReactWebDatabase.ts';
+import { init, init_experimental } from './init.ts';
+import { Cursors } from './Cursors.tsx';
 
 export {
   id,
@@ -77,6 +88,7 @@ export {
   type InstantSchemaDatabase,
   type IInstantDatabase,
   type InstaQLParams,
+  type InstaQLFields,
 
   // schema types
   type AttrsDefs,
@@ -99,4 +111,15 @@ export {
   type InstantRules,
   type UpdateParams,
   type LinkParams,
+  type ExchangeCodeForTokenParams,
+  type SendMagicCodeParams,
+  type SendMagicCodeResponse,
+  type SignInWithIdTokenParams,
+  type VerifyMagicCodeParams,
+  type VerifyResponse,
+
+  // storage types
+  type FileOpts,
+  type UploadFileResponse,
+  type DeleteFileResponse,
 };

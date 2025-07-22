@@ -11,7 +11,7 @@
   (:import
    (java.time Instant)
    (java.time.temporal ChronoUnit)
-   (java.util UUID)))
+   (java.util Date UUID)))
 
 (def etype "$magicCodes")
 
@@ -19,7 +19,7 @@
   (rand-num-str 6))
 
 (defn create!
-  ([params] (create! (aurora/conn-pool) params))
+  ([params] (create! (aurora/conn-pool :write) params))
   ([conn {:keys [app-id id code user-id]}]
    (update-op
     conn
@@ -37,10 +37,10 @@
 (defn expired?
   ([magic-code] (expired? (Instant/now) magic-code))
   ([now {created-at :created_at}]
-   (> (.between ChronoUnit/HOURS (.toInstant created-at) now) 24)))
+   (> (.between ChronoUnit/HOURS (Date/.toInstant created-at) now) 24)))
 
 (defn consume!
-  ([params] (consume! (aurora/conn-pool) params))
+  ([params] (consume! (aurora/conn-pool :write) params))
   ([conn {:keys [email code app-id] :as params}]
    (update-op
     conn

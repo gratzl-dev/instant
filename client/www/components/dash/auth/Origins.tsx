@@ -1,13 +1,37 @@
 import { FormEventHandler, useContext, useState } from 'react';
 import { errorToast } from '@/lib/toast';
 import config from '@/lib/config';
-import { AuthorizedOrigin, AuthorizedOriginService, InstantApp, InstantError, OAuthClient, OAuthServiceProvider } from '@/lib/types';
+import {
+  AuthorizedOrigin,
+  AuthorizedOriginService,
+  InstantApp,
+  InstantIssue,
+  OAuthClient,
+  OAuthServiceProvider,
+} from '@/lib/types';
 import { jsonFetch } from '@/lib/fetch';
 import { TokenContext } from '@/lib/contexts';
-import { messageFromInstantError } from '@/lib/auth';
-import { Button, Content, Dialog, Label, SectionHeading, SubsectionHeading, Select, TextInput, useDialog } from '@/components/ui';
-import { InformationCircleIcon, PlusIcon, TrashIcon } from '@heroicons/react/solid'; 
-import { DeviceMobileIcon, GlobeAltIcon } from '@heroicons/react/outline';
+import { messageFromInstantError } from '@/lib/errors';
+import {
+  Button,
+  Content,
+  Dialog,
+  Label,
+  SectionHeading,
+  SubsectionHeading,
+  Select,
+  TextInput,
+  useDialog,
+} from '@/components/ui';
+import {
+  InformationCircleIcon,
+  PlusIcon,
+  TrashIcon,
+} from '@heroicons/react/24/solid';
+import {
+  DevicePhoneMobileIcon,
+  GlobeAltIcon,
+} from '@heroicons/react/24/outline';
 import NetlifyIcon from '../../icons/NetlifyIcon';
 import VercelIcon from '../../icons/VercelIcon';
 
@@ -144,7 +168,7 @@ export function AuthorizedOriginsForm({
     } catch (e) {
       console.error(e);
       const msg =
-        messageFromInstantError(e as InstantError) || 'Error creating origin.';
+        messageFromInstantError(e as InstantIssue) || 'Error creating origin.';
       errorToast(msg, { autoClose: 5000 });
     } finally {
       setIsLoading(false);
@@ -232,7 +256,7 @@ export function originIcon(origin: AuthorizedOrigin) {
     case 'vercel':
       return VercelIcon;
     case 'custom-scheme':
-      return DeviceMobileIcon;
+      return DevicePhoneMobileIcon;
     default:
       return GlobeAltIcon;
   }
@@ -311,7 +335,7 @@ export function AuthorizedOriginRow({
     } catch (e) {
       console.error(e);
       const msg =
-        messageFromInstantError(e as InstantError) || 'Error removing origin.';
+        messageFromInstantError(e as InstantIssue) || 'Error removing origin.';
       errorToast(msg, { autoClose: 5000 });
     } finally {
       setIsLoading(false);

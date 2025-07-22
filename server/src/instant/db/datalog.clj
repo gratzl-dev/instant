@@ -30,22 +30,24 @@
   (:require [clojure.spec.alpha :as s]
             [clojure.set :as set]
             [instant.db.model.triple :as triple-model]
+            [instant.flags :as flags]
             [instant.util.spec :as uspec]
-            [instant.data.constants :refer [zeneca-app-id]]
-            [clojure.spec.gen.alpha :as gen]
             [instant.util.tracer :as tracer]
             [instant.util.coll :as coll]
             [clojure.string :as string]
             [honey.sql :as hsql]
             [instant.jdbc.sql :as sql]
             [instant.util.json :refer [->json]]
-            [instant.util.string :refer [safe-name]])
-  (:import (com.zaxxer.hikari HikariDataSource)
-           (java.time Instant)
+            [instant.util.pg-hint-plan :as pg-hint]
+            [instant.util.string :refer [safe-name]]
+            [instant.util.uuid :as uuid-util])
+  (:import (javax.sql DataSource)
            (java.util UUID)))
 
 ;; ---
 ;; Pattern
+
+(s/def ::$entityIdStartsWith string?)
 
 (defn pattern-component [v-type]
   (s/or :constant (s/coll-of v-type :kind set? :min-count 0)
@@ -53,6 +55,8 @@
         :variable symbol?))
 
 (s/def ::$not ::triple-model/value)
+;; $not for the entity_id should always be a uuid
+(s/def :datalog-entity-id/$not uuid?)
 (s/def ::attr-id uuid?)
 (s/def ::nil? boolean?)
 (s/def ::$isNull (s/keys :req-un [::attr-id ::nil?]))
@@ -62,12 +66,17 @@
 (s/def ::value any?)
 (s/def ::$comparator (s/keys :req-un [::op ::data-type ::value]))
 
+(s/def ::entity-value-component (s/or :constant (s/coll-of ::triple-model/lookup :kind set? :min-count 0)
+                                      :any #{'_}
+                                      :variable symbol?
+                                      :function (s/keys :req-un [:datalog-entity-id/$not])))
+
 (s/def ::value-pattern-component (s/or :constant (s/coll-of ::triple-model/value
                                                             :kind set?
                                                             :min-count 0)
                                        :any #{'_}
                                        :variable symbol?
-                                       :function (s/keys :req-un [(or ::$not ::$isNull ::$comparator)])))
+                                       :function (s/keys :req-un [(or ::$not ::$isNull ::$comparator ::$entityIdStartsWith)])))
 
 (s/def ::idx-key #{:ea :eav :av :ave :vae})
 (s/def ::data-type #{:string :number :boolean :date})
@@ -77,7 +86,7 @@
 
 (s/def ::pattern
   (s/cat :idx ::index
-         :e (pattern-component ::triple-model/lookup)
+         :e ::entity-value-component
          :a (pattern-component uuid?)
          :v ::value-pattern-component
          :created-at (pattern-component number?)))
@@ -95,8 +104,6 @@
 
 (def variable? (fn [x]
                  (and (symbol? x) (not= x '_))))
-
-(def constant? (comp not symbol?))
 
 (def named-variable? (partial uspec/tagged-as? :variable))
 (def named-constant? (partial uspec/tagged-as? :constant))
@@ -122,12 +129,16 @@
    (map-indexed
     (fn [i c]
       (if (or
+           (and (= i 0)
+                (map? c)
+                (contains? c :$not))
            ;; Don't override function clauses
            (and (= i 2)
                 (map? c)
                 (or (contains? c :$not)
                     (contains? c :$isNull)
-                    (contains? c :$comparator)))
+                    (contains? c :$comparator)
+                    (contains? c :$entityIdStartsWith)))
            (symbol? c)
            (set? c))
         c
@@ -160,6 +171,12 @@
     (case tag
       :map (:idx-key v)
       :keyword v)))
+
+(defn idx-data-type [idx]
+  (let [[tag v] idx]
+    (case tag
+      :map (:data-type v)
+      :keyword nil)))
 
 (defn untag-e
   "Removes the tag from the entity-id position, where it can be either :entity-id
@@ -219,6 +236,18 @@
 ;; ----------
 ;; symbol-map
 
+(defn make-binding-path
+  "Generates the binding path for a symbol in the symbol-map."
+  [pattern-idx named-p component]
+  {:pattern-idx pattern-idx
+   :triple-idx (case component
+                 :e 0
+                 :a 1
+                 :v 2)
+   :ctype component
+   :ref? (and (= :v component)
+              (= :vae (idx-key (:idx named-p))))})
+
 (defn symbol-map-of-pattern
   "Given a named pattern, returns a mapping of symbols to their
    binding paths:
@@ -228,18 +257,29 @@
 
    ;=>
 
-   {?a [[idx 0]],
-    ?b [[idx 1]],
-    ?c [[idx 2]]}"
-  [pattern-idx {:keys [e a v]}]
-  (reduce (fn [acc [x path]]
-            (if (named-variable? x)
-              (update acc (uspec/tagged-unwrap x) (fnil conj []) path)
-              acc))
+   {?a [{:pattern-idx 0
+         :triple-idx 0
+         :ctype :e
+         :ref? false}],
+    ?b [{:pattern-idx 0
+         :triple-idx 1
+         :ctype :a
+         :ref? false}],
+    ?c [{:pattern-idx 0
+         :triple-idx 2
+         :ctype :v
+         :ref? false}]}"
+  [pattern-idx named-p]
+  (reduce (fn [acc ctype]
+            (let [x (get named-p ctype)]
+              (if (named-variable? x)
+                (update acc
+                        (uspec/tagged-unwrap x)
+                        (fnil conj [])
+                        (make-binding-path pattern-idx named-p ctype))
+                acc)))
           {}
-          [[e [pattern-idx 0]]
-           [a [pattern-idx 1]]
-           [v [pattern-idx 2]]]))
+          [:e :a :v]))
 
 ;; ----
 ;; join-vals
@@ -374,7 +414,7 @@
                   (swap! checked-for-sym update sym (fnil conj #{}) pattern-idx)
                   (->> (symbol-map sym)
                        (filter
-                        (fn [[sym-idx _]]
+                        (fn [{sym-idx :pattern-idx}]
                           (cond
                             (@ok-patterns sym-idx)
                             true
@@ -506,20 +546,20 @@
   (string/replace (name x) "-" "_"))
 
 (defn- match-table-cols
-  "Every match table returns entity-id, attr-id, value-blob, value-uuid,
+  "Every match table returns entity-id, attr-id, value, is-ref-val,
    and created-at columns. This is a quick helper to generate the column names"
   [table-name]
   [(kw table-name :-entity-id)
    (kw table-name :-attr-id)
-   (kw table-name :-value-blob)
-   (kw table-name :-value-uuid)
+   (kw table-name :-value)
+   (kw table-name :-is-ref-val)
    (kw table-name :-created-at)])
 
 (defn- match-table-select
   "This generates the select portion of the match table. "
   [table-name]
   (map vector [:entity-id :attr-id :value
-               [:case :eav [:cast [:->> :value :0] :uuid] :else :null]
+               :eav
                :created-at]
        (match-table-cols table-name)))
 
@@ -538,12 +578,23 @@
 (defn- value->jsonb [x]
   [:cast (->json x) :jsonb])
 
-(defn extract-value-fn [data-type]
+(defn extract-value-fn [data-type op]
   (case data-type
-    :date :triples_extract_date_value
+    :date  :triples_extract_date_value
     :number :triples_extract_number_value
-    :string :triples_extract_string_value
+    :string (case op
+              (:like :ilike) :triples_extract_string_value
+              nil)
     :boolean :triples_extract_boolean_value))
+
+(defn data-type-comparison [data-type op col val]
+  (if-let [f (extract-value-fn data-type op)]
+    [:and
+     [op [f col] val]
+     [:=
+      :checked_data_type
+      [:cast [:inline (name data-type)] :checked_data_type]]]
+    [op col (value->jsonb val)]))
 
 (defn- not-eq-value [idx val]
   (let [[tag idx-val] idx
@@ -551,10 +602,13 @@
                     :keyword nil
                     :map (:data-type idx-val))]
     (if-not data-type
-      [:not= :value (value->jsonb val)]
-      [:and
-       [:= :checked_data_type [:cast [:inline (name data-type)] :checked_data_type]]
-       [:not= [(extract-value-fn data-type) :value] val]])))
+      [:not=
+       (if (= idx-val :av)
+         ;; Make sure it uses the av_index
+         [:json_null_to_null :value]
+         :value)
+       (value->jsonb val)]
+      (data-type-comparison data-type :is-distinct-from :value val))))
 
 (defn- in-or-eq-value [idx v-set]
   (let [[tag idx-val] idx
@@ -564,31 +618,66 @@
     (if (empty? v-set)
       [:= 0 1]
       (if-not data-type
-        (in-or-eq :value (map value->jsonb v-set))
+        (in-or-eq (case idx-val
+                    ;; Make sure av uses the av_index
+                    :av [:json_null_to_null :value]
+                    ;; Make sure vae uses the vae_uuid_index
+                    ;; and eav uses the eav_uuid_index
+                    (:eav :vae) [:json_uuid_to_uuid :value]
+
+                    :value)
+                  (if (or (= :vae idx-val)
+                          (= :eav idx-val))
+                    v-set
+                    (map value->jsonb v-set)))
+
         (list* :or (map (fn [v]
-                          [:and
-                           [:= :checked_data_type [:cast [:inline (name data-type)] :checked_data_type]]
-                           [:= [(extract-value-fn data-type) :value] v]])
+                          (data-type-comparison data-type := :value v))
                         v-set))))))
 
 (defn- constant->where-part [idx app-id component-type [_ v]]
   (condp = component-type
-    :e (list* :or
-              (for [lookup v]
-                (if (uuid? lookup)
-                  [:= :entity-id lookup]
-                  [:=
-                   :entity-id
-                   {:select :entity-id
-                    :from :triples
-                    :where [:and
-                            [:= :app-id app-id]
-                            [:= :value [:cast (->json (second lookup)) :jsonb]]
-                            [:= :attr-id [:cast (first lookup) :uuid]]]}])))
-    :a (in-or-eq :attr-id v)
+    :e (if (every? uuid? v)
+         (case (count v)
+           0 [:= 0 1]
+           1 [:= :entity-id (first v)]
+           [:= :entity-id [:any (with-meta v {:pgtype "uuid[]"})]])
+         (list* :or
+                (for [lookup v]
+                  (if (uuid? lookup)
+                    [:= :entity-id lookup]
+                    [:=
+                     :entity-id
+                     {:select :entity-id
+                      :from :triples
+                      :where [:and
+                              [:= :app-id app-id]
+
+                              [:=
+                               ;; Make sure it uses the av_index
+                               [:json_null_to_null :value]
+                               [:cast (->json (second lookup)) :jsonb]]
+                              [:= :attr-id [:cast (first lookup) :uuid]]
+                              :av]}]))))
+    :a (case (count v)
+         0 [:= 0 1]
+         1 [:= :attr-id (first v)]
+         [:= :attr-id [:any (with-meta v {:pgtype "uuid[]"})]])
     :v (in-or-eq-value idx v)))
 
-(defn- value-function-clauses [idx [v-tag v-value]]
+(def all-zeroes-uuid "00000000-0000-0000-0000-000000000000")
+(defn prefix->uuid-start [s]
+  (if (<= 36 (count s))
+    (uuid-util/coerce s)
+    (uuid-util/coerce (str s (subs all-zeroes-uuid (count s))))))
+
+(def all-fs-uuid "ffffffff-ffff-ffff-ffff-ffffffffffff")
+(defn prefix->uuid-end [^String s]
+  (if (<= 36 (count s))
+    (uuid-util/coerce s)
+    (uuid-util/coerce (str s (subs all-fs-uuid (count s))))))
+
+(defn- value-function-clauses [app-id idx [v-tag v-value]]
   (case v-tag
     :function (let [[func val] (first v-value)]
                 (case func
@@ -597,32 +686,116 @@
                                :not-in
                                :in)
                              :entity-id
-                             {:select (if (and (:ref? val)
-                                               (:reverse? val))
-                                        [[[:cast [:->> :t.value :0] :uuid]]]
-                                        :t.entity-id)
-                              :from [[:triples :t]]
-                              :where [:and
-                                      [:= :t.entity-id :entity-id]
-                                      [:= :t.attr-id (:attr-id val)]
-                                      [:not= :t.value [:cast (->json nil) :jsonb]]]}]]
+                             (let [reverse-ref? (and (:ref? val)
+                                                     (:reverse? val))]
+                               {:select (if reverse-ref?
+                                          [[[:cast [:->> :t.value :0] :uuid]]]
+                                          :t.entity-id)
+                                :from [[:triples :t]]
+                                :where (list* :and
+                                              [:= :t.app-id app-id]
+                                              [:= :t.entity-id :entity-id]
+                                              [:= :t.attr-id (:attr-id val)]
+                                              (when reverse-ref?
+                                                :eav)
+                                              (if-let [data-type (:indexed-checked-type val)]
+                                                [:ave
+                                                 (data-type-comparison data-type :not= :t.value nil)]
+                                                [[:not= :t.value [:cast (->json nil) :jsonb]]]))})]]
                   :$comparator (let [{:keys [op value data-type]} val]
-                                 [[(case op
-                                     :$gt :>
-                                     :$gte :>=
-                                     :$lt :<
-                                     :$lte :<=
-                                     :$like :like
-                                     :$ilike :ilike)
-                                   [(extract-value-fn data-type)
-                                    :value]
-                                   value]
-                                  ;; Need this check so that postgres knows it can use the index
-                                  [:= :checked_data_type [:cast [:inline (name data-type)] :checked_data_type]]])))
+                                 [(data-type-comparison data-type
+                                                        (case op
+                                                          :$gt :>
+                                                          :$gte :>=
+                                                          :$lt :<
+                                                          :$lte :<=
+                                                          :$like :like
+                                                          :$ilike :ilike)
+                                                        :value
+                                                        value)])
+                  :$entityIdStartsWith
+                  (let [prefix val]
+                    [[:and
+                      [:>= :entity-id (prefix->uuid-start prefix)]
+                      [:<= :entity-id (prefix->uuid-end prefix)]]])))
     []))
 
-(defn- function-clauses [named-pattern]
-  (value-function-clauses (:idx named-pattern) (:v named-pattern)))
+(defn- entity-function-clauses [[e-tag e-value]]
+  (case e-tag
+    :function (let [[func val] (first e-value)]
+                (case func
+                  :$not [[:not= :entity-id val]]))
+    []))
+
+(defn- function-clauses [app-id named-pattern]
+  (concat
+   (value-function-clauses app-id (:idx named-pattern) (:v named-pattern))
+   (entity-function-clauses (:e named-pattern))))
+
+(defn patch-values-for-av-index
+  "Make sure we wrap :value in [:json_null_to_null :value] when using :av
+   or postgres won't use the index."
+  [idx-key clauses]
+  (if-not (= idx-key :av)
+    clauses
+    (map (fn [clause]
+           (if (and (vector? clause)
+                    (= (nth clause 1) :value))
+             (update clause 1 (fn [v] [:json_null_to_null v]))
+             clause))
+         clauses)))
+
+(def index-configs
+  [{:name :triples_pkey
+    :cols [:e :a]}
+   {:name :ave_index
+    :cols [:a :v]
+    :idx-key :ave}
+   {:name :ea_index
+    :cols [:e :a]
+    :idx-key :ea}
+   {:name :eav_uuid_index
+    :cols [:e :a :v]
+    :idx-key :eav}
+   {:name :triples_string_trgm_gist_idx
+    :cols [:a :v]
+    :idx-key :ave
+    :data-type :string}
+   {:name :vae_uuid_index
+    :cols [:v :a :e]
+    :idx-key :vae}
+   {:name :triples_created_at_idx
+    :cols [:a :created-at]}
+   {:name :av_index
+    :cols [:a :v :e]
+    :idx-key :av}
+   {:name :triples_number_type_idx
+    :cols [:a :v]
+    :idx-key :ave
+    :data-type :number}
+   {:name :triples_boolean_type_idx
+    :cols [:a :v]
+    :idx-key :ave
+    :data-type :boolean}
+   {:name :triples_date_type_idx
+    :cols [:a :v]
+    :idx-key :ave
+    :data-type :date}])
+
+(defn pg-hint-index [[tag v :as idx]]
+  (if (and (= tag :map)
+           (= (:idx-key v) :ave))
+    (case (:data-type v)
+      :string :triples_string_trgm_gist_idx
+      :number :triples_number_type_idx
+      :boolean :triples_boolean_type_idx
+      :date :triples_date_type_idx)
+    (case (idx-key idx)
+      :ea :ea_index
+      :eav :eav_index
+      :av :av_index
+      :ave :ave_index
+      :vae :vae_index)))
 
 (defn- where-clause
   "
@@ -644,14 +817,8 @@
                 constant-components
                 (map (fn [[component-type v]]
                        (constant->where-part idx app-id component-type v))))
-           (function-clauses named-pattern)
-           additional-clauses)))
-
-(comment
-  (where-clause
-   zeneca-app-id
-   (s/conform ::pattern (gen/generate (s/gen ::pattern)))
-   nil))
+           (function-clauses app-id named-pattern)
+           (patch-values-for-av-index (idx-key idx) additional-clauses))))
 
 ;; ---
 ;; join-clause
@@ -665,6 +832,9 @@
 (def ^:private component-type->col-name
   {:e :entity-id :a :attr-id :v :value :created-at :created-at})
 
+(defn qualify-col [prefix binding-path col]
+  (kw prefix (:pattern-idx binding-path) "-" col))
+
 (defn- join-cols
   "Given the component types and the index of the dest table,
 
@@ -672,50 +842,61 @@
 
    For example:
 
-   [1 [:v :v]] => [:value :match-1-value-blob]
-   [1 [:e :v]] => [:entity-id :match-1-value-uuid]
-   [1 [:v :a]] => [:value [:to_jsonb :match-1-attr-id]]"
-  [prefix dest-idx [origin-ctype dest-ctype]]
+   [:m {:ctype :v} {:ctype :v :pattern-idx 1}] => [:value :m-1-value]
+   [:m {:ctype :e} {:ctype v :pattern-idx 1 :ref? true}]
+     => [:entity-id [:json_uuid_to_uuid :match-1-value]]
+   [:m {:ctype v :ref? true} {:ctype :e :pattern-idx 1}]
+     => [[:json_uuid_to_uuid :value] :match-1-entity-id]"
+  ([prefix origin-binding-path dest-binding-path]
+   (join-cols prefix origin-binding-path dest-binding-path {:qualify-origin? false}))
+  ([prefix origin-binding-path dest-binding-path {:keys [qualify-origin?]}]
+   (let [origin-base-col (cond->> (component-type->col-name (:ctype origin-binding-path))
+                           qualify-origin? (qualify-col prefix origin-binding-path))
+         dest-base-col (qualify-col prefix
+                                    dest-binding-path
+                                    (component-type->col-name (:ctype dest-binding-path)))]
 
-  (let [dest-col #(kw prefix dest-idx "-" %)]
-    (cond
-      (every? #{:v} [origin-ctype dest-ctype])
-      [:value (dest-col :value-blob)]
-
-      (= :v origin-ctype)
-      [:value [:to_jsonb (dest-col (component-type->col-name dest-ctype))]]
-
-      (= :v dest-ctype)
-      [(component-type->col-name origin-ctype) (dest-col :value-uuid)]
-
-      :else
-      [(component-type->col-name origin-ctype)
-       (dest-col (component-type->col-name dest-ctype))])))
+     [(if (:ref? origin-binding-path)
+        [:json_uuid_to_uuid origin-base-col]
+        origin-base-col)
+      (if (:ref? dest-binding-path)
+        [:json_uuid_to_uuid dest-base-col]
+        dest-base-col)])))
 
 (comment
-  (join-cols :match- 1 [:v :v]))
+  (join-cols :match-
+             {:ctype :v
+              :pattern-idx 1}
+             {:ctype :v
+              :pattern-idx 2})
+
+  (join-cols :match-
+             {:ctype :v
+              :ref? true
+              :pattern-idx 1}
+             {:ctype :e
+              :pattern-idx 2}))
 
 (defn- join-cond
   "Generates a single join condition,
    given the origin component type and the destination path"
-  [prefix origin-ctype [dest-idx dest-col-idx]]
-  (let [dest-ctype (idx->component-type dest-col-idx)
-        [origin-col dest-col] (join-cols prefix dest-idx [origin-ctype dest-ctype])]
+  [prefix origin-binding-path dest-binding-path]
+  (let [[origin-col dest-col] (join-cols prefix origin-binding-path dest-binding-path)]
     [:= origin-col dest-col]))
 
 (defn- join-cond-for-or
   "Generates a join cond for the set of paths generated by the or ctes.
    Each path in the set should be joined with OR"
-  [prefix ctype paths]
+  [prefix origin-binding-path paths]
   (list* :or
          (map (fn [paths]
                 (if (set? paths)
-                  (join-cond-for-or prefix ctype paths)
+                  (join-cond-for-or prefix origin-binding-path paths)
                   (list* :and
                          (map (fn [path]
                                 (if (set? path)
-                                  (join-cond-for-or prefix ctype path)
-                                  (join-cond prefix ctype path)))
+                                  (join-cond-for-or prefix origin-binding-path path)
+                                  (join-cond prefix origin-binding-path path)))
                               paths))))
               paths)))
 
@@ -728,98 +909,225 @@
 
    The second part joins the first on
 
-   [[:= :entity-id :match-0-value-uuid]]"
-  [prefix symbol-map named-p]
+   [[:= :entity-id [:json_uuid_to_uuid :match-0-value]]]"
+  [prefix pattern-idx symbol-map named-p]
   (->> named-p
        variable-components
        (keep (fn [[ctype [_ sym]]]
                (when-let [paths (get symbol-map sym)]
-                 (map (fn [path]
-                        (if (set? path)
-                          (join-cond-for-or prefix ctype path)
-                          (join-cond prefix ctype path)))
-                      paths))))
+                 (let [binding-path (make-binding-path pattern-idx named-p ctype)]
+                   (map (fn [path]
+                          (if (set? path)
+                            (join-cond-for-or prefix binding-path path)
+                            (join-cond prefix binding-path path)))
+                        paths)))))
        (apply concat)))
 
 (defn- join-cond-for-or-gather
   "Generates a join condition for combining two or ctes. In contrast to join-cond,
    each column name needs to be fully qualified."
-  [prefix [origin-idx origin-col-idx] [dest-idx dest-col-idx]]
-  (let [origin-ctype (idx->component-type origin-col-idx)
-        dest-ctype (idx->component-type dest-col-idx)
-        [origin-col dest-col] (join-cols prefix dest-idx [origin-ctype dest-ctype])
-        origin-col (if (= origin-col :value)
-                     :value-blob
-                     origin-col)]
-    [:= (kw prefix origin-idx "-" origin-col) dest-col]))
+  [prefix origin-binding-path dest-binding-path]
+  (let [[origin-col dest-col] (join-cols prefix
+                                         origin-binding-path
+                                         dest-binding-path
+                                         {:qualify-origin? true})]
+    [:= origin-col dest-col]))
 
-(defn- or-join-cond-for-or-gather
-  [prefix dest-paths origin-path]
-  (mapv (fn [dest-path]
-          (cond (set? dest-path)
-                (list* :or (or-join-cond-for-or-gather prefix dest-path origin-path))
+(defn- or-join-conds-for-or-gather
+  "Generates join conditions for origin-paths and dest-paths.
+   origin-paths and dest-paths have the same shape. They can either be:
+     1. A single path [cte-idx col-idx]
+     2. A list of paths [path-1, path-2], where we need to join them with AND
+     3. A set of paths #{path-1, path-2}, where we need to join them with OR
+   Something like type path = (int, int) | Array<path> | Set<path>"
+  [prefix origin-paths dest-paths]
+  (cond (and (map? origin-paths)
+             (map? dest-paths))
+        [(join-cond-for-or-gather prefix origin-paths dest-paths)]
 
-                (and (= 2 (count dest-path))
-                     (every? int? dest-path))
-                (join-cond-for-or-gather prefix origin-path dest-path)
+        (set? origin-paths)
+        [(list* :or (mapcat (fn [o]
+                              (or-join-conds-for-or-gather prefix o dest-paths))
+                            origin-paths))]
 
-                :else
-                (list* :and (or-join-cond-for-or-gather prefix dest-path origin-path))))
-        dest-paths))
+        (set? dest-paths)
+        [(list* :or (mapcat (fn [d]
+                              (or-join-conds-for-or-gather prefix origin-paths d))
+                            dest-paths))]
+
+        (map? origin-paths)
+        [(list* :and (mapcat (fn [d]
+                               (or-join-conds-for-or-gather prefix origin-paths d))
+                             dest-paths))]
+
+        :else
+        [(list* :and (mapcat (fn [o]
+                               (or-join-conds-for-or-gather prefix o dest-paths))
+                             origin-paths))]))
 
 (defn join-conds-for-or-gather
   "Generates the join conditions for connecting the or cte into the previous ctes."
   [prefix symbol-map or-symbol-maps join-sym]
   (let [ors (for [or-symbol-map or-symbol-maps
-                  :let [ands (for [dest-paths (get symbol-map join-sym)
-                                   origin-path (get or-symbol-map join-sym)]
-                               (if (set? dest-paths)
-                                 (list* :or (map (fn [paths]
-                                                   (or-join-cond-for-or-gather prefix paths origin-path))
-                                                 dest-paths))
-                                 (join-cond-for-or-gather prefix dest-paths origin-path)))]
+                  :let [dest-paths (get symbol-map join-sym)
+                        origin-paths (get or-symbol-map join-sym)
+                        ands (or-join-conds-for-or-gather prefix origin-paths dest-paths)]
                   :when (seq ands)]
               (list* :and ands))]
     (when (seq ors)
       (list* :or ors))))
 
+(def ^:dynamic *testing-pg-hints* false)
+
+(defn test-pg-hints? []
+  *testing-pg-hints*)
+
+(defn best-index
+  "Determines the best index to use based on which components we know will be
+   defined at this point in the query."
+  [named-p symbol-map]
+  (let [components [:e :a :v]
+
+        known-components
+        (set (filter (fn [c]
+                       (let [[tag value] (get named-p c)]
+                         (case tag
+                           :constant true
+                           :any false
+                           :function true
+                           :variable (contains? symbol-map value))))
+                     components))
+
+        ;; it may be a good idea to give something a better score if it's a
+        ;; constant rather than in the symbol-map
+        scored-indexes
+        (map (fn [{:keys [cols] :as idx-config}]
+               (let [score (if (or (and (:idx-key idx-config)
+                                        (not= (:idx-key idx-config)
+                                              (idx-key (:idx named-p))))
+                                   (and (:data-type idx-config)
+                                        (or (not (= (:data-type idx-config)
+                                                    (idx-data-type (:idx named-p))))
+                                            (and (= :string (:data-type idx-config))
+                                                 (not (and (= :function (-> named-p
+                                                                            :v
+                                                                            first))
+                                                           (contains? #{:$like :$ilike}
+                                                                      (-> named-p
+                                                                          :v
+                                                                          second
+                                                                          :$comparator
+                                                                          :op))))))))
+                             -1
+                             (+ (if (and (:idx-key idx-config)
+                                         (= (:idx-key idx-config)
+                                            (idx-key (:idx named-p))))
+                                  0.5
+                                  0)
+                                (count (take-while (fn [col]
+                                                     (contains? known-components col))
+                                                   cols))))]
+                 (assoc idx-config :score score)))
+             index-configs)
+
+        best-index (last (sort-by :score scored-indexes))]
+    best-index))
+
 ;; ---
 ;; match-query
 
+(defn flatten-symbol-map-values [vs]
+  (mapcat (fn [v]
+            (if (set? v)
+              (mapcat flatten-symbol-map-values v)
+              [v]))
+          vs))
+
+(defn transform-named-p-for-ref-joins
+  "If we're joining e -> e or e -> v, it's better to use the eav index
+  instead of the vae index. It would be cleaner to make this choice in
+  attr-pat.clj, but at that point we don't know what we're going to be
+  joining to since the patterns might be reordered in
+  optimize-attr-pats."
+  [symbol-map named-p]
+  (if (not= :vae (idx-key (:idx named-p)))
+    named-p
+    (let [join-ctypes (reduce (fn [acc [ctype [_ sym]]]
+                                (if-let [paths (some-> (get symbol-map sym)
+                                                       flatten-symbol-map-values)]
+                                  (into acc (map (fn [path]
+                                                   [ctype (:ctype path)])
+                                                 paths))
+                                  acc)
+                                )
+                              #{}
+                              (variable-components named-p))]
+      (if (or (= #{[:e :e]} join-ctypes)
+              (= #{[:e :v]} join-ctypes))
+        (assoc named-p :idx [:keyword :eav])
+        named-p))))
+
 (defn- joining-with
-  "Produces subsequent match tables. Each table joins
-   on the previous table unless it is the first cte or the
-   start of a new AND/OR clause.
-   additional-joins is a map from symbol to path. It allows us to connect the
+  "Produces subsequent match tables. Each table joins on the previous
+   table unless it is the first cte or the start of a new AND/OR
+   clause.
+   `additional-joins` is a map from symbol to binding-path that
+   matches the structure of the symbol-map. It allows us to connect the
    cte to the parent cte if this is a child pattern in a nested query."
-  [prefix app-id additional-joins symbol-map prev-idx start-of-group? named-p]
-  (let [cur-idx (inc prev-idx)
+  [prefix app-id additional-joins symbol-map prev-idx start-of-group? named-p {:keys [page-info]}]
+  (let [named-p (transform-named-p-for-ref-joins symbol-map named-p)
+        cur-idx (inc prev-idx)
         cur-table (kw prefix cur-idx)
+        triples-alias (kw :t cur-idx)
         prev-table (when-not (or start-of-group? (neg? prev-idx))
                      (kw prefix prev-idx))
         joins (if start-of-group?
                 []
-                (join-conds prefix symbol-map named-p))
+                (join-conds prefix cur-idx symbol-map named-p))
         parent-joins (->> named-p
                           variable-components
                           (keep (fn [[ctype [_ sym]]]
                                   (when-let [path (get additional-joins sym)]
-                                    (join-cond prefix ctype path)))))
+                                    (join-cond prefix
+                                               (make-binding-path cur-idx named-p ctype)
+                                               path)))))
         all-joins (into joins parent-joins)
         parent-froms (->> named-p
                           variable-components
                           (keep (fn [[_ [_ sym]]]
-                                  (when-let [path (get additional-joins sym)]
-                                    (kw prefix (first path))))))]
-    [cur-table
-     {:select (concat (when prev-table
-                        [(kw prev-table :.*)])
-                      (match-table-select cur-table))
-      :from (concat (list* :triples (when prev-table
-                                      [prev-table]))
-                    parent-froms)
-      :where (where-clause app-id named-p all-joins)}
-     :materialized]))
+                                  (when-let [{:keys [pattern-idx]} (get additional-joins sym)]
+                                    (kw prefix pattern-idx)))))
+        cte [cur-table
+             {:select (concat (when prev-table
+                                [(kw prev-table :.*)])
+                              (match-table-select cur-table))
+              :from (concat (list* [:triples triples-alias]
+                                   (when prev-table
+                                     [prev-table]))
+                            parent-froms)
+              :where (where-clause app-id named-p all-joins)}
+             (if (or
+                  ;; only use `not materialized` when we're in the middle of an ordered
+                  ;; query
+                  (not page-info)
+
+                  ;; skip isNull because it's unlikely to generate a good plan
+                  (and (uspec/tagged-as? :function (:v named-p))
+                       (:$isNull (uspec/tagged-unwrap (:v named-p))))
+
+                  ;; skip indexed with constant value because it's likely
+                  ;; to return a small set of elements and we'll spend forever
+                  ;; looping through the sorted elements
+                  (and (= :ave (idx-key (:idx named-p)))
+                       (named-constant? (:v named-p))))
+               :materialized
+               :not-materialized)]]
+    {:cte cte
+     :pg-hints (if (test-pg-hints?)
+                 (let [best-idx (best-index named-p (merge symbol-map
+                                                           additional-joins))]
+                   [(pg-hint/index-scan triples-alias (:name best-idx))])
+                 [])}))
 
 (defn symbol-fields-of-pattern
   "Keeps track of which idx in the triple maps to which variable.
@@ -839,7 +1147,7 @@
               (if (named-variable? x)
                 (assoc acc pat-idx {:sym sym
                                     :ref-value? (and (= :v component)
-                                                     (= :eav (idx-key (:idx named-p))))})
+                                                     (= :vae (idx-key (:idx named-p))))})
                 acc)))
           {}
           [[:e 0] [:a 1] [:v 2]]))
@@ -847,18 +1155,21 @@
 (defn cte-for-pattern
   "Generates cte for a pattern. Also generates the symbol map and pattern
    metadata that will be used to generate the query result from the sql data."
-  [prefix app-id additional-joins {:keys [idx symbol-map group-idx]} pattern]
+  [prefix app-id additional-joins {:keys [idx symbol-map group-idx]} pattern opts]
   (let [start-of-group? (zero? group-idx)
         cte-cols (mapv sql-name (match-table-cols (kw prefix idx)))
         symbol-fields (symbol-fields-of-pattern pattern)
-        prev-idx (dec idx)]
-    {:ctes (joining-with prefix
-                         app-id
-                         additional-joins
-                         symbol-map
-                         prev-idx
-                         start-of-group?
-                         pattern)
+        prev-idx (dec idx)
+        {:keys [cte pg-hints]} (joining-with prefix
+                                             app-id
+                                             additional-joins
+                                             symbol-map
+                                             prev-idx
+                                             start-of-group?
+                                             pattern
+                                             opts)]
+    {:cte cte
+     :pg-hints pg-hints
      :symbol-map (symbol-map-of-pattern idx pattern)
      :pattern-meta {:cte-cols cte-cols
                     :symbol-fields symbol-fields
@@ -889,50 +1200,64 @@
                 ;; Include the previous cte if we're not the first
                 [prev-table])
               [(kw prefix (first join-idxes))])}
-      (when full-join-idxes
-        {:full-join (mapcat (fn [i]
-                              ;; Ensures everything is included
-                              [(kw prefix i) [:= :0 :1]])
-                            full-join-idxes)})
-      (when-not (neg? prev-idx)
+      (if-not prev-table
+        (merge {:from (kw prefix (first join-idxes))}
+               (when full-join-idxes
+                 {:full-join (mapcat (fn [i]
+                                       ;; Ensures everything is included
+                                       [(kw prefix i) [:= :0 :1]])
+                                     full-join-idxes)}))
+        {:from prev-table
+         :left-join (mapcat
+                     (fn [[cte-idx or-symbol-map]]
+                       [(kw prefix cte-idx) (join-conds-for-or-gather prefix
+                                                                      symbol-map
+                                                                      [or-symbol-map]
+                                                                      join-sym)])
+                     group-symbol-maps)})
+      (when prev-table
         (when-let [wheres (join-conds-for-or-gather prefix
                                                     symbol-map
-                                                    group-symbol-maps
+                                                    (vals group-symbol-maps)
                                                     join-sym)]
-          {:where wheres})))]))
+          {:where wheres})))
+     :not-materialized]))
 
 (defn accumulate-ctes
   "Walks the patterns to generate the list of CTEs. Also generates the metadata
    that will be used to transform the sql result into the query result."
-  [prefix app-id additional-joins acc [tag pattern]]
+  [prefix app-id additional-joins acc [tag pattern] opts]
   (case tag
-    :pattern (let [{:keys [ctes symbol-map pattern-meta]}
+    :pattern (let [{:keys [cte pg-hints symbol-map pattern-meta]}
                    (cte-for-pattern prefix
                                     app-id
                                     additional-joins
                                     {:idx (:next-idx acc)
                                      :group-idx (:group-idx acc)
                                      :symbol-map (:symbol-map acc)}
-                                    pattern)]
+                                    pattern
+                                    opts)]
                (-> acc
-                   (update :ctes conj ctes)
+                   (update :ctes conj cte)
+                   (update :pg-hints into pg-hints)
                    (update :next-idx inc)
                    (update :group-idx inc)
                    (update :symbol-map #(merge-with into % symbol-map))
                    (update :pattern-metas conj pattern-meta)))
 
     :and (reduce (fn [acc pat]
-                   (accumulate-ctes prefix app-id additional-joins acc pat))
+                   (accumulate-ctes prefix app-id additional-joins acc pat opts))
                  acc
                  (:and pattern))
 
     :or (let [{:keys [patterns join-sym]} (:or pattern)
               {:keys [group-acc]}
               (reduce (fn [{:keys [acc group-acc]} pat]
-                        (let [res (accumulate-ctes prefix app-id additional-joins acc pat)]
+                        (let [res (accumulate-ctes prefix app-id additional-joins acc pat opts)]
                           {:acc {:next-idx (:next-idx res)
                                  :group-idx 0
                                  :ctes []
+                                 :pg-hints []
                                  :symbol-map {}
                                  :pattern-metas []
                                  :or-idxes (conj (or (:or-idxes acc) #{})
@@ -940,19 +1265,24 @@
                            :group-acc (-> group-acc
                                           (assoc :next-idx (:next-idx res))
                                           (update :ctes into (:ctes res))
+                                          (update :pg-hints into (:pg-hints res))
                                           (update :or-idxes conj (dec (:next-idx res)))
-                                          (update :symbol-maps conj (:symbol-map res))
+                                          (update :symbol-maps
+                                                  assoc
+                                                  (dec (:next-idx res))
+                                                  (:symbol-map res))
                                           (update :pattern-metas conj (:pattern-metas res)))}))
                       {;; :group-acc collects information about each OR clause
                        :group-acc {:next-idx (:next-idx acc)
                                    :ctes (:ctes acc)
+                                   :pg-hints (:pg-hints acc)
                                    ;; Collect pattern maps from each or branch so that
                                    ;; we can build the topics in isolation
                                    :pattern-metas []
                                    ;; Collect symbol maps from each or branch so that
                                    ;; we can join the branches in to the rest of the
                                    ;; ctes
-                                   :symbol-maps []
+                                   :symbol-maps {}
                                    ;; Keep track of the last cte in each or branch
                                    ;; so that we can construct a cte to collect all
                                    ;; the results
@@ -962,6 +1292,7 @@
                        :acc {:next-idx (:next-idx acc)
                              :group-idx 0
                              :ctes []
+                             :pg-hints []
                              :symbol-map {}
                              :pattern-metas []
                              :or-idxes (:or-idxes acc)}}
@@ -986,27 +1317,29 @@
                            (:or-idxes group-acc))
            :group-idx (inc (:group-idx acc))
            :ctes (conj (:ctes group-acc) gather-cte)
+           :pg-hints (:pg-hints group-acc)
            :symbol-map (merge-with into
                                    (:symbol-map acc)
                                    (apply merge-with (fn [& xs]
                                                        [(set xs)])
-                                          (:symbol-maps group-acc)))
+                                          (vals (:symbol-maps group-acc))))
            :pattern-metas (conj (:pattern-metas acc) {:or (:pattern-metas group-acc)})})))
 
 (defn match-query
   "Generates honeysql data structure to produce sql that joins named patterns,
    and the metadata that will be used to transform the sql result into the query
    result."
-  ([prefix app-id named-patterns]
-   (match-query {} prefix app-id {} named-patterns))
-  ([acc prefix app-id additional-joins named-patterns]
-   (let [{:keys [ctes pattern-metas symbol-map next-idx]}
+  ([prefix app-id named-patterns opts]
+   (match-query {} prefix app-id {} named-patterns opts))
+  ([acc prefix app-id additional-joins named-patterns opts]
+   (let [{:keys [ctes pg-hints pattern-metas symbol-map next-idx]}
          (reduce (fn [acc pattern]
-                   (accumulate-ctes prefix app-id additional-joins acc pattern))
+                   (accumulate-ctes prefix app-id additional-joins acc pattern opts))
                  (merge {:next-idx 0
                          ;; Used to determine the start of an or/and clause
                          :group-idx 0
                          :ctes []
+                         :pg-hints []
                          :symbol-map {}
                          ;; Metadata for each pattern that we'll use to transform the
                          ;; sql data into the datalog query result
@@ -1022,6 +1355,7 @@
       :symbol-map symbol-map
       :query {:with ctes
               :select (kw last-table-name :.*)
+              :pg-hints pg-hints
               :from last-table-name}})))
 
 (defn component-type-of-sym
@@ -1047,54 +1381,64 @@
                      [:before :desc] :>
                      [:after :asc] :>
                      [:after :desc] :<)
-        order-col (if (= order-col-type :created-at-timestamp)
-                    order-col-name
-                    [(extract-value-fn order-col-type) order-col-name])
+        order-col-value-fn (when (not= order-col-type :created-at-timestamp)
+                             (extract-value-fn order-col-type comparison))
+        order-col (if order-col-value-fn
+                    [order-col-value-fn order-col-name]
+                    order-col-name)
         order-col-val [:cast
                        (cond (and (keyword? cursor-val)
-                                  (not= order-col-type :created-at-timestamp))
-                             [(extract-value-fn order-col-type) cursor-val]
+                                  (not= order-col-type :created-at-timestamp)
+                                  order-col-value-fn)
+                             [order-col-value-fn cursor-val]
 
                              (= :date order-col-type)
-                             (cond (string? cursor-val)
-                                   (Instant/parse cursor-val)
-                                   (number? cursor-val)
-                                   (Instant/ofEpochMilli cursor-val))
+                             (triple-model/parse-date-value cursor-val)
+
+                             (= :string order-col-type)
+                             (->json cursor-val)
 
                              :else
                              cursor-val)
                        (case order-col-type
                          :created-at-timestamp :bigint
                          :boolean :boolean
-                         :string :text
+                         :string :jsonb
                          :number :double-precision
                          :date :timestamp-with-time-zone)]]
 
     (update query :where (fn [where]
                            [:and
                             where
-                            [:or
-                             [:or [comparison order-col order-col-val]
-                              ;; null > null => null in postgres, so we have to
-                              ;; do some extra work to order nulls first.
-                              ;; n.b. if the user can specify nulls-first or nulls-last
-                              ;; then we need to take that into account here
-                              (case comparison
-                                :> [:and
-                                    [:not= nil order-col]
-                                    [:= nil order-col-val]]
-                                :< [:and
-                                    [:= nil order-col]
-                                    [:not= nil order-col-val]])]
-                             [:and
-                              ;; is not distinct from would be nice here, but not supported
-                              ;; by honeysql
+                            (if (= order-col-type :created-at-timestamp)
+                              ;; If we're using created-at, we can skip the null checks
                               [:or
+                               [comparison order-col order-col-val]
                                [:and
-                                [:= order-col nil]
-                                [:= order-col-val nil]]
-                               [:= order-col order-col-val]]
-                              [comparison entity-id-col [:cast (first cursor) :uuid]]]]]))))
+                                [:= order-col order-col-val]
+                                [comparison entity-id-col [:cast (first cursor) :uuid]]]]
+                              [:or
+                               [:or [comparison order-col order-col-val]
+                                ;; null > null => null in postgres, so we have to
+                                ;; do some extra work to order nulls first.
+                                ;; n.b. if the user can specify nulls-first or nulls-last
+                                ;; then we need to take that into account here
+                                (case comparison
+                                  :> [:and
+                                      [:not= nil order-col]
+                                      [:= nil order-col-val]]
+                                  :< [:and
+                                      [:= nil order-col]
+                                      [:not= nil order-col-val]])]
+                               [:and
+                                ;; is not distinct from would be nice here, but not supported
+                                ;; by honeysql
+                                [:or
+                                 [:and
+                                  [:= order-col nil]
+                                  [:= order-col-val nil]]
+                                 [:= order-col order-col-val]]
+                                [comparison entity-id-col [:cast (first cursor) :uuid]]]])]))))
 
 (defn reverse-direction [direction]
   (case direction
@@ -1127,22 +1471,16 @@
            after]
     :as page-info}]
   (let [page-pattern (second named-pattern) ;; remove tag
-        [table query] (joining-with prefix
-                                    app-id
-                                    additional-joins
-                                    symbol-map
-                                    (dec next-idx)
-                                    false
-                                    page-pattern)
-        prev-table (kw prefix (dec next-idx))
-
-        entity-id-col (if (= :created-at-timestamp order-col-type)
-                        :entity-id
-                        (kw prev-table :-entity-id))
-
-        entity-id-col-full-name (if (= :created-at-timestamp order-col-type)
-                                  (kw table :-entity-id)
-                                  (kw prev-table :-entity-id))
+        {:keys [cte pg-hints]} (joining-with prefix
+                                             app-id
+                                             additional-joins
+                                             symbol-map
+                                             (dec next-idx)
+                                             false
+                                             page-pattern
+                                             {:page-info page-info})
+        [table query] cte
+        entity-id-col :entity-id
         sym-component-type (component-type-of-sym named-pattern order-sym)
         sym-triple-idx (get (set/map-invert idx->component-type)
                             sym-component-type)
@@ -1156,36 +1494,42 @@
                              (reverse-direction direction)
                              direction)
 
-        type-where (when (not= order-col-type :created-at-timestamp)
-                     [[:= :checked_data_type [:cast [:inline (name order-col-type)] :checked_data_type]]])
+        ;; Will be nil if we're sorting by serverCreatedAt or string
+        order-col-value-fn (when-not (= order-col-type :created-at-timestamp)
+                             (extract-value-fn order-col-type :>))
 
         query (-> query
-                  ;; Move `where` to join conds so that we get the null fields
-                  (dissoc :where :from)
-                  (assoc :from [prev-table])
-                  (assoc :left-join [:triples (concat (:where query)
-                                                      type-where)])
-
-                  ;; Make sure we're getting each entity once
+                  (update :where (fn [wheres]
+                                   (if-not order-col-value-fn
+                                     wheres
+                                     ;; Make sure we use the index for ordering
+                                     (list :and [:= :checked_data_type
+                                                 [:cast [:inline (name order-col-type)] :checked_data_type]]
+                                           wheres))))
                   (dissoc :select)
-                  (assoc :select-distinct-on (list* [:order-val entity-id-col]
-                                                    [(if (= order-col-type :created-at-timestamp)
-                                                       [:cast order-col-name :bigint]
-                                                       [(extract-value-fn order-col-type) order-col-name])
-                                                     :order-val]
-                                                    (:select query))))
+                  (assoc :select-distinct-on (list*
+                                              [:order-val :order-eid]
+                                              [(if order-col-value-fn
+                                                 [order-col-value-fn  order-col-name]
+                                                 order-col-name)
+                                               :order-val]
+                                              [entity-id-col :order-eid]
+                                              (:select query))))
 
         order-by [[:order-val
-                   (if (= order-by-direction :desc)
-                     (kw order-by-direction :-nulls-last)
-                     (kw order-by-direction :-nulls-first))
+                   (if-not order-col-value-fn
+                     ;; No nulls in this case, so no need to specify null-first/last
+                     order-by-direction
+                     (if (= order-by-direction :desc)
+                       (kw order-by-direction :-nulls-last)
+                       (kw order-by-direction :-nulls-first)))
                    order-by-direction]
-                  [entity-id-col
+                  [:order-eid
                    order-by-direction]]
 
         paged-query (cond-> query
                       true (assoc :order-by order-by)
-                      limit (assoc :limit limit)
+                      limit (assoc :limit (inc limit))
                       offset (assoc :offset offset)
                       after (add-cursor-comparisons {:direction direction
                                                      :sym-triple-idx sym-triple-idx
@@ -1205,16 +1549,17 @@
         first-row-table (kw table :-first)
         last-row-table (kw table :-last)
         first-row-cte [first-row-table
-                       {:select [[entity-id-col-full-name :e]
+                       {:select [[:order-eid :e]
                                  [(kw table :- (if (= :value order-col-name)
-                                                 :value-blob
+                                                 :value
                                                  order-col-name)) :sym]]
                         :from table
-                        :limit 1}]
+                        :limit 1}
+                       :not-materialized]
         last-row-cte [last-row-table
-                      {:select [[entity-id-col-full-name :e]
+                      {:select [[:order-eid :e]
                                 [(kw table :- (if (= :value order-col-name)
-                                                :value-blob
+                                                :value
                                                 order-col-name)) :sym]]
                        :from [[{:select [(kw table :.*)
                                          ;; trick to get the last row in the cte
@@ -1222,56 +1567,105 @@
                                 :from table}
                                :subquery]]
                        :order-by [[:sort-id :desc]]
-                       :limit 1}]
+                       :limit 1}
+                      :not-materialized]
 
-        has-next-query (-> query
-                           (assoc :order-by order-by)
-                           (assoc :limit 1)
-                           (update :from (fn [from]
+        has-next-query (cond
+                         ;; We get everything, so no next page
+                         (and (not limit)
+                              (not before))
+                         {:select 1 :where false}
+
+                         ;; We got a page with no restriction on forward
+                         ;; items so we can just check if our overfetched
+                         ;; item is present
+                         (and limit
+                              (not before)
+                              (not last?))
+                         {:select :*
+                          :from (kw table :-with-next)
+                          :offset limit}
+
+                         :else
+                         (-> query
+                             (assoc :order-by order-by)
+                             (assoc :limit 1)
+                             (update :from
+                                     (fn [from]
+                                       (concat [[(if last?
+                                                   ;; reverse direction when last?
+                                                   first-row-table
+                                                   last-row-table) :cursor-row]]
+                                               from)))
+                             ;; Use the first row as the cursor to check has prev page
+                             (add-cursor-comparisons {:direction direction
+                                                      :sym-triple-idx 1
+                                                      :order-col-name order-col-name
+                                                      :order-col-type order-col-type
+                                                      :cursor [:cursor-row.e
+                                                               :cursor-row.sym]
+                                                      :cursor-type :after
+                                                      :entity-id-col entity-id-col})))
+
+        has-previous-query (cond
+                             ;; We got everything before, so no prev page
+                             (and (not after)
+                                  (or (not offset)
+                                      (zero? offset))
+                                  (not last?))
+                             {:select 1 :where false}
+
+                             ;; We got the results reversed with no restriction
+                             ;; on forward items, so we can just cehck if our
+                             ;; overfetched item is present
+                             (and last?
+                                  limit
+                                  (not after))
+                             {:select :*
+                              :from (kw table :-with-next)
+                              :offset limit}
+
+                             :else
+                             (-> query
+                                 (assoc :order-by order-by)
+                                 (assoc :limit 1)
+                                 (update :from
+                                         (fn [from]
                                            (concat [[(if last?
                                                        ;; reverse direction when last?
-                                                       first-row-table
-                                                       last-row-table) :cursor-row]]
+                                                       last-row-table
+                                                       first-row-table) :cursor-row]]
                                                    from)))
-                           ;; Use the last row as the cursor to check has next page
-                           (add-cursor-comparisons {:direction direction
-                                                    :sym-triple-idx 1
-                                                    :order-col-name order-col-name
-                                                    :order-col-type order-col-type
-                                                    :cursor [:cursor-row.e
-                                                             :cursor-row.sym]
-                                                    :cursor-type :after
-                                                    :entity-id-col entity-id-col}))
-        has-previous-query (-> query
-                               (assoc :order-by order-by)
-                               (assoc :limit 1)
-                               (update :from
-                                       (fn [from]
-                                         (concat [[(if last?
-                                                     ;; reverse direction when last?
-                                                     last-row-table
-                                                     first-row-table) :cursor-row]]
-                                                 from)))
-                               ;; Use the first row as the cursor to check has prev page
-                               (add-cursor-comparisons {:direction direction
-                                                        :sym-triple-idx 1
-                                                        :order-col-name order-col-name
-                                                        :order-col-type order-col-type
-                                                        :cursor [:cursor-row.e
-                                                                 :cursor-row.sym]
-                                                        :cursor-type :before
-                                                        :entity-id-col entity-id-col}))
+                                 ;; Use the first row as the cursor to check has prev page
+                                 (add-cursor-comparisons {:direction direction
+                                                          :sym-triple-idx 1
+                                                          :order-col-name order-col-name
+                                                          :order-col-type order-col-type
+                                                          :cursor [:cursor-row.e
+                                                                   :cursor-row.sym]
+                                                          :cursor-type :before
+                                                          :entity-id-col entity-id-col})))
 
         last-table-name (kw prefix next-idx)]
     {:next-idx (inc next-idx)
      :query {:with (conj (:with (:query match-query))
-                         [table paged-query]
+                         [(kw table :-with-next) paged-query :materialized]
+                         [table
+                          (merge {:select :*
+                                  :from (kw table :-with-next)}
+                                 (when limit
+                                   {:limit limit}))
+                          :materialized]
                          first-row-cte
                          last-row-cte
                          [(has-next-tbl table)
-                          {:select [[[:exists has-next-query]]]}]
+                          {:select [[[:exists has-next-query]]]}
+                          :not-materialized]
                          [(has-prev-tbl table)
-                          {:select [[[:exists has-previous-query]]]}])
+                          {:select [[[:exists has-previous-query]]]}
+                          :not-materialized])
+             :pg-hints (into (:pg-hints (:query match-query))
+                               pg-hints)
              :select (kw last-row-table :.*)
              :from last-table-name}
      :symbol-map symbol-map
@@ -1280,10 +1674,7 @@
                            :symbol-fields {}
                            :pattern page-pattern
                            :page-info (assoc page-info
-                                             :eid-col (-> pattern-metas
-                                                          last
-                                                          :cte-cols
-                                                          first)
+                                             :eid-col "order_eid"
                                              :created-col (-> pattern-metas
                                                               last
                                                               :cte-cols
@@ -1293,6 +1684,7 @@
   ([prefix app-id nested-named-patterns]
    (let [acc {:next-idx 0
               :ctes []
+              :pg-hints []
               :result-tables []
               :pattern-groups []}]
      (accumulate-nested-match-query acc {} prefix app-id nested-named-patterns)))
@@ -1312,17 +1704,20 @@
                                              prefix
                                              app-id
                                              additional-joins
-                                             (:patterns pattern-group))
+                                             (:patterns pattern-group)
+                                             {:page-info page-info})
                           page-info (add-page-info prefix
                                                    app-id
                                                    additional-joins
                                                    page-info))
 
                         ctes (:with query)
+                        pg-hints (:pg-hints query)
 
                         next-acc (cond-> acc
                                    true (assoc :next-idx next-idx)
                                    true (update :ctes into ctes)
+                                   true (update :pg-hints into pg-hints)
                                    true (update :result-tables
                                                 conj
                                                 {:table (:from query)
@@ -1344,18 +1739,31 @@
                                    :table (:from query)}))
                       (let [join-sym (get-in pattern-group [:children :join-sym])
                             join-cte [(kw prefix next-idx)
-                                      {:select [[[:distinct :entity-id] (kw prefix next-idx :-entity-id)]]
-                                       :from [:triples (kw prefix (dec next-idx))]
-                                       :where (list* :and
-                                                     [:= :app-id app-id]
-                                                     (join-conds prefix
-                                                                 symbol-map
-                                                                 {:e [:variable join-sym]}))}]
+                                      (let [conds (join-conds prefix
+                                                              (dec next-idx)
+                                                              symbol-map
+                                                              {:e [:variable join-sym]})]
+                                        (if-let [single-field (when (and (= 1 (count conds))
+                                                                         (= [:= :entity-id]
+                                                                            (take 2 (first conds))))
+                                                                (last (first conds)))]
+                                          ;; If we're only joining on a single col, we can just grab
+                                          ;; that col directly from the CTE
+                                          {:select [[[:distinct single-field] (kw prefix next-idx :-entity-id)]]
+                                           :from (kw prefix (dec next-idx))}
+                                          {:select [[[:distinct :entity-id] (kw prefix next-idx :-entity-id)]]
+                                           :from [:triples (kw prefix (dec next-idx))]
+                                           :where (list* :and
+                                                         [:= :app-id app-id]
+                                                         conds)}))
+                                      :materialized]
                             child-res (accumulate-nested-match-query (-> next-acc
                                                                          (update :ctes conj join-cte)
                                                                          (update :next-idx inc)
                                                                          (assoc :pattern-groups []))
-                                                                     {join-sym [next-idx 0]}
+                                                                     {join-sym {:pattern-idx next-idx
+                                                                                :triple-idx 0
+                                                                                :ctype :e}}
                                                                      prefix
                                                                      app-id
                                                                      pattern-group)]
@@ -1381,17 +1789,26 @@
   topics (replacing join-sym with the actual value), and fully-qualified datalog
   queries."
   [_ctx prefix app-id nested-named-patterns]
-  (let [{:keys [ctes result-tables children]}
+  (let [{:keys [ctes result-tables children pg-hints]}
         (accumulate-nested-match-query prefix app-id nested-named-patterns)
+        tables (set (map :table result-tables))
         query (when (seq ctes)
-                {:with (map #(if (= (count %) 2)
+                {:with (map #(cond
                                ;; Forces postgres to only evaluate the cte once
                                ;; https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-CTE-MATERIALIZATION
+                               (= (count %) 2)
                                (conj % :materialized)
+
+                               ;; We're in the result table, so let's make sure we're materialized
+                               (contains? tables (first %))
+                               (assoc % 2 :materialized)
                                ;; If count != 2, then someone higher up set a materialized
                                ;; option, let's not override their wisdom.
-                               %)
+                               :else %)
                             ctes)
+                 :pg-hints (if (flags/toggled? :disable-pg-hints)
+                             []
+                             pg-hints)
                  :select [[(into [:json_build_array]
                                  (mapv (fn [tables]
                                          (into [:json_build_object]
@@ -1423,20 +1840,21 @@
     (parse-uuid x)))
 
 (defn- sql-row->triple
-  "Converts the sql result, which returns value in either the
-   value-uuid or value-blob col, into our triple format.
+  "Converts the sql result into our triple format.
    Optionally parses uuids, when handling batched results that return JSON"
-  [row [e-col a-col v-blob-col v-uuid-col t-col] coerce-uuids?]
+  [row [e-col a-col v-blob-col v-is-ref-val-col t-col] coerce-uuids?]
   (if coerce-uuids?
     [(safe-parse-uuid (get row e-col))
      (safe-parse-uuid (get row a-col))
-     (or (safe-parse-uuid (get row v-uuid-col))
-         (get row v-blob-col))
+     (if (get row v-is-ref-val-col)
+       (safe-parse-uuid (get row v-blob-col))
+       (get row v-blob-col))
      (get row t-col)]
     [(get row e-col)
      (get row a-col)
-     (or (get row v-uuid-col)
-         (get row v-blob-col))
+     (if (get row v-is-ref-val-col)
+       (safe-parse-uuid (get row v-blob-col))
+       (get row v-blob-col))
      (get row t-col)]))
 
 (defn- ensure-default-symbol-values [symbol-fields symbol-values]
@@ -1815,7 +2233,7 @@
   "Sends a single query, returns the join rows."
   [_ctx conn app-id named-patterns]
   (tracer/with-span! {:name "datalog/send-query-single"}
-    (let [{:keys [query pattern-metas]} (match-query :match-0- app-id named-patterns)
+    (let [{:keys [query pattern-metas]} (match-query :match-0- app-id named-patterns {})
           sql-query (hsql/format query)
           sql-res (sql/select-string-keys ::send-query-single conn sql-query)]
       (sql-result->result sql-res
@@ -1839,7 +2257,7 @@
   [ctx conn app-id nested-named-patterns]
   (tracer/with-span! {:name "datalog/send-query-nested"}
     (let [{:keys [query children]} (nested-match-query ctx
-                                                       :match-0-
+                                                       :m-
                                                        app-id
                                                        nested-named-patterns)
           query-hash (or (:query-hash ctx)
@@ -1853,8 +2271,12 @@
                                      [[:inline query-hash]]]}]))
 
           sql-query (hsql/format query)
+          postgres-config (flags/query-flags query-hash)
           sql-res (when query ;; we may not have a query if everything is missing attrs
-                    (->> (sql/select-arrays ::send-query-nested conn sql-query)
+                    (->> (sql/select-arrays ::send-query-nested
+                                            conn
+                                            sql-query
+                                            {:postgres-config postgres-config})
                          ;; remove header row
                          second
                          ;; all results are in one json blob in first result
@@ -1876,8 +2298,8 @@
   (tracer/with-span! {:name "datalog/send-query-batch"
                       :attributes {:batch-size (count args-col)}}
     (let [batch-data (map-indexed
-                      (fn [i args]
-                        (apply match-query (kw "match-" i "-") args))
+                      (fn [i [app-id named-patterns]]
+                        (match-query (kw "match-" i "-") app-id named-patterns {}))
                       args-col)
           hsql-query (batch-queries (map :query batch-data))
           sql-query (hsql/format hsql-query)
@@ -1904,15 +2326,18 @@
   (let [nested-named-patterns (nested->named-patterns patterns)]
     (throw-invalid-nested-patterns nested-named-patterns)
     (let [{:keys [query]} (nested-match-query ctx
-                                              :match-0-
+                                              :m-
                                               (:app-id ctx)
                                               nested-named-patterns)
-          sql-query (update (hsql/format query)
-                            0
-                            (fn [s]
-                              (str "explain (analyze, verbose, buffers, timing, format json) " s)))]
-
-      (first (sql/select-string-keys (-> ctx :db :conn-pool) sql-query)))))
+          sql-query (hsql/format
+                     (assoc query
+                            :raw
+                            "explain (analyze, verbose, buffers, timing, format json)"))]
+      (when query
+        (sql/select-string-keys ::explain
+                                (-> ctx :db :conn-pool)
+                                sql-query
+                                {:attach-warnings? true})))))
 
 (defn query
   "Executes a Datalog(ish) query over the given aurora `conn`, Instant `app_id`
@@ -1974,7 +2399,7 @@
                     ;; other threads will add additional items to our batch.
                     ;; Be careful not to do additional blocking code while we
                     ;; have the connection checked out.
-                    (sql/with-connection [conn ^HikariDataSource (:conn-pool db)]
+                    (sql/with-connection [conn ^DataSource (:conn-pool db)]
                       (let [items (take-batch! datalog-loader (:conn-pool db) max-items)]
                         (try
                           (if (= 1 (count items))

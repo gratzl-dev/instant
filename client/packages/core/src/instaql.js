@@ -1,6 +1,6 @@
-import { query as datalogQuery } from "./datalog";
-import { uuidCompare } from "./utils/uuid";
-import * as s from "./store";
+import { query as datalogQuery } from './datalog.js';
+import { uuidCompare } from './utils/uuid.ts';
+import * as s from './store.js';
 
 // Pattern variables
 // -----------------
@@ -21,7 +21,7 @@ function makeVarImpl(x, level) {
 class AttrNotFoundError extends Error {
   constructor(message) {
     super(message);
-    this.name = "AttrNotFoundError";
+    this.name = 'AttrNotFoundError';
   }
 }
 
@@ -43,7 +43,7 @@ function eidWhere(makeVar, store, etype, level) {
     makeVar(etype, level),
     idAttr(store, etype).id,
     makeVar(etype, level),
-    makeVar("time", level),
+    makeVar('time', level),
   ];
 }
 
@@ -60,25 +60,25 @@ function refAttrPat(makeVar, store, etype, level, label) {
     throw new AttrNotFoundError(`Could not find attr for ${[etype, label]}`);
   }
 
-  if (attr["value-type"] !== "ref") {
+  if (attr['value-type'] !== 'ref') {
     throw new Error(`Attr ${attr.id} is not a ref`);
   }
 
-  const [_f, fwdEtype] = attr["forward-identity"];
-  const [_r, revEtype] = attr["reverse-identity"];
+  const [_f, fwdEtype] = attr['forward-identity'];
+  const [_r, revEtype] = attr['reverse-identity'];
   const nextLevel = level + 1;
   const attrPat = fwdAttr
     ? [
         makeVar(fwdEtype, level),
         attr.id,
         makeVar(revEtype, nextLevel),
-        wildcard("time"),
+        wildcard('time'),
       ]
     : [
         makeVar(fwdEtype, nextLevel),
         attr.id,
         makeVar(revEtype, level),
-        wildcard("time"),
+        wildcard('time'),
       ];
 
   const nextEtype = fwdAttr ? revEtype : fwdEtype;
@@ -89,18 +89,22 @@ function refAttrPat(makeVar, store, etype, level, label) {
 }
 
 function makeLikeMatcher(caseSensitive, pattern) {
-  if (typeof pattern !== "string") {
+  if (typeof pattern !== 'string') {
     return function likeMatcher(_value) {
       return false;
     };
   }
-  const regexPattern = pattern.replace(/%/g, ".*").replace(/_/g, ".");
+
+  const escapedPattern = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const regexPattern = escapedPattern.replace(/%/g, '.*').replace(/_/g, '.');
+
   const regex = new RegExp(
     `^${regexPattern}$`,
-    caseSensitive ? undefined : "i",
+    caseSensitive ? undefined : 'i',
   );
+
   return function likeMatcher(value) {
-    if (typeof value !== "string") {
+    if (typeof value !== 'string') {
       return false;
     }
     return regex.test(value);
@@ -109,16 +113,16 @@ function makeLikeMatcher(caseSensitive, pattern) {
 
 function parseValue(attr, v) {
   if (
-    typeof v !== "object" ||
-    v.hasOwnProperty("$in") ||
-    v.hasOwnProperty("in")
+    typeof v !== 'object' ||
+    v.hasOwnProperty('$in') ||
+    v.hasOwnProperty('in')
   ) {
     return v;
   }
 
-  const isDate = attr["checked-data-type"] === "date";
+  const isDate = attr['checked-data-type'] === 'date';
 
-  if (v.hasOwnProperty("$gt")) {
+  if (v.hasOwnProperty('$gt')) {
     return {
       $comparator: true,
       $op: isDate
@@ -130,7 +134,7 @@ function parseValue(attr, v) {
           },
     };
   }
-  if (v.hasOwnProperty("$gte")) {
+  if (v.hasOwnProperty('$gte')) {
     return {
       $comparator: true,
       $op: isDate
@@ -143,7 +147,7 @@ function parseValue(attr, v) {
     };
   }
 
-  if (v.hasOwnProperty("$lt")) {
+  if (v.hasOwnProperty('$lt')) {
     return {
       $comparator: true,
       $op: isDate
@@ -155,7 +159,7 @@ function parseValue(attr, v) {
           },
     };
   }
-  if (v.hasOwnProperty("$lte")) {
+  if (v.hasOwnProperty('$lte')) {
     return {
       $comparator: true,
       $op: isDate
@@ -168,7 +172,7 @@ function parseValue(attr, v) {
     };
   }
 
-  if (v.hasOwnProperty("$like")) {
+  if (v.hasOwnProperty('$like')) {
     const matcher = makeLikeMatcher(true, v.$like);
     return {
       $comparator: true,
@@ -178,7 +182,7 @@ function parseValue(attr, v) {
     };
   }
 
-  if (v.hasOwnProperty("$ilike")) {
+  if (v.hasOwnProperty('$ilike')) {
     const matcher = makeLikeMatcher(false, v.$ilike);
     return {
       $comparator: true,
@@ -202,8 +206,8 @@ function valueAttrPat(makeVar, store, valueEtype, valueLevel, valueLabel, v) {
     );
   }
 
-  if (v?.hasOwnProperty("$isNull")) {
-    const idAttr = s.getAttrByFwdIdentName(store, valueEtype, "id");
+  if (v?.hasOwnProperty('$isNull')) {
+    const idAttr = s.getAttrByFwdIdentName(store, valueEtype, 'id');
     if (!idAttr) {
       throw new AttrNotFoundError(
         `No attr for etype = ${valueEtype} label = id`,
@@ -214,7 +218,7 @@ function valueAttrPat(makeVar, store, valueEtype, valueLevel, valueLabel, v) {
       makeVar(valueEtype, valueLevel),
       idAttr.id,
       { $isNull: { attrId: attr.id, isNull: v.$isNull, reverse: !fwdAttr } },
-      wildcard("time"),
+      wildcard('time'),
     ];
   }
 
@@ -223,10 +227,10 @@ function valueAttrPat(makeVar, store, valueEtype, valueLevel, valueLabel, v) {
       makeVar(valueEtype, valueLevel),
       attr.id,
       parseValue(attr, v),
-      wildcard("time"),
+      wildcard('time'),
     ];
   }
-  return [v, attr.id, makeVar(valueEtype, valueLevel), wildcard("time")];
+  return [v, attr.id, makeVar(valueEtype, valueLevel), wildcard('time')];
 }
 
 function refAttrPats(makeVar, store, etype, level, refsPath) {
@@ -275,21 +279,22 @@ function withJoin(where, join) {
 }
 
 function isOrClauses([k, v]) {
-  return k === "or" && Array.isArray(v);
+  return k === 'or' && Array.isArray(v);
 }
 
 function isAndClauses([k, v]) {
-  return k === "and" && Array.isArray(v);
+  return k === 'and' && Array.isArray(v);
 }
 
 // Creates a makeVar that will namespace symbols for or clauses
 // to prevent conflicts, except for the base etype
-function genMakeVar(baseMakeVar, etype, orIdx) {
+function genMakeVar(baseMakeVar, joinSym, orIdx) {
   return (x, lvl) => {
-    if (x == etype) {
-      return baseMakeVar(x, lvl);
+    const base = baseMakeVar(x, lvl);
+    if (joinSym == base) {
+      return base;
     }
-    return `${baseMakeVar(x, lvl)}-${orIdx}`;
+    return `${base}-${orIdx}`;
   };
 }
 
@@ -301,11 +306,11 @@ function parseWhereClauses(
   level,
   whereValue,
 ) {
+  const joinSym = makeVar(etype, level);
   const patterns = whereValue.map((w, i) => {
-    const makeNamespacedVar = genMakeVar(makeVar, etype, i);
+    const makeNamespacedVar = genMakeVar(makeVar, joinSym, i);
     return parseWhere(makeNamespacedVar, store, etype, level, w);
   });
-  const joinSym = makeVar(etype, level);
   return { [clauseType]: { patterns, joinSym } };
 }
 
@@ -330,15 +335,20 @@ function whereCondAttrPatsForNullIsTrue(makeVar, store, etype, level, path) {
 function parseWhere(makeVar, store, etype, level, where) {
   return Object.entries(where).flatMap(([k, v]) => {
     if (isOrClauses([k, v])) {
-      return parseWhereClauses(makeVar, "or", store, etype, level, v);
+      return parseWhereClauses(makeVar, 'or', store, etype, level, v);
     }
     if (isAndClauses([k, v])) {
-      return parseWhereClauses(makeVar, "and", store, etype, level, v);
+      return parseWhereClauses(makeVar, 'and', store, etype, level, v);
     }
 
-    const path = k.split(".");
+    // Temporary hack until we have support for a uuid index on `id`
+    if (k === '$entityIdStartsWith') {
+      return [];
+    }
 
-    if (v?.hasOwnProperty("$not")) {
+    const path = k.split('.');
+
+    if (v?.hasOwnProperty('$not')) {
       // `$not` won't pick up entities that are missing the attr, so we
       // add in a `$isNull` to catch those too.
       const notPats = whereCondAttrPats(makeVar, store, etype, level, path, v);
@@ -359,7 +369,7 @@ function parseWhere(makeVar, store, etype, level, where) {
       ];
     }
 
-    if (v?.hasOwnProperty("$isNull") && v.$isNull === true && path.length > 1) {
+    if (v?.hasOwnProperty('$isNull') && v.$isNull === true && path.length > 1) {
       // Make sure we're capturing all of the intermediate paths that might be null
       // by checking for null at each step along the path
       return [
@@ -395,7 +405,7 @@ function makeWhere(store, etype, level, where) {
 // -----------------
 
 function makeFind(makeVar, etype, level) {
-  return [makeVar(etype, level), makeVar("time", level)];
+  return [makeVar(etype, level), makeVar('time', level)];
 }
 
 // extendObjects
@@ -414,7 +424,7 @@ function makeJoin(makeVar, store, etype, level, label, eid) {
 }
 
 function extendObjects(makeVar, store, { etype, level, form }, objects) {
-  const childQueries = Object.keys(form).filter((c) => c !== "$");
+  const childQueries = Object.keys(form).filter((c) => c !== '$');
   if (!childQueries.length) {
     return Object.values(objects);
   }
@@ -464,7 +474,7 @@ function extendObjects(makeVar, store, { etype, level, form }, objects) {
 
 function shouldIgnoreAttr(attrs, id) {
   const attr = attrs[id];
-  return attr["value-type"] === "ref" && attr["forward-identity"][2] !== "id";
+  return attr['value-type'] === 'ref' && attr['forward-identity'][2] !== 'id';
 }
 
 function compareOrder([id_a, v_a], [id_b, v_b]) {
@@ -493,15 +503,15 @@ function comparableDate(x) {
 
 function isBefore(startCursor, orderAttr, direction, idVec) {
   const [c_e, _c_a, c_v, c_t] = startCursor;
-  const compareVal = direction === "desc" ? 1 : -1;
-  if (orderAttr["forward-identity"]?.[2] === "id") {
+  const compareVal = direction === 'desc' ? 1 : -1;
+  if (orderAttr['forward-identity']?.[2] === 'id') {
     return compareOrder(idVec, [c_e, c_t]) === compareVal;
   }
   const [e, v] = idVec;
   const v_new =
-    orderAttr["checked-data-type"] === "date" ? comparableDate(v) : v;
+    orderAttr['checked-data-type'] === 'date' ? comparableDate(v) : v;
   const c_v_new =
-    orderAttr["checked-data-type"] === "date" ? comparableDate(c_v) : c_v;
+    orderAttr['checked-data-type'] === 'date' ? comparableDate(c_v) : c_v;
   return compareOrder([e, v_new], [c_e, c_v_new]) === compareVal;
 }
 
@@ -524,6 +534,32 @@ function getOrderAttr(store, etype, cursor, order) {
   }
 }
 
+function objectAttrs(store, etype, dq) {
+  if (!Array.isArray(dq.fields)) {
+    return s.getBlobAttrs(store, etype);
+  }
+
+  const attrs = new Map();
+
+  for (const field of dq.fields) {
+    const attr = s.getAttrByFwdIdentName(store, etype, field);
+    const label = attr?.['forward-identity']?.[2];
+    if (label && s.isBlob(attr)) {
+      attrs.set(label, attr);
+    }
+  }
+  // Ensure we add the id field to avoid empty objects
+  if (!attrs.has('id')) {
+    const attr = s.getAttrByFwdIdentName(store, etype, 'id');
+    const label = attr?.['forward-identity']?.[2];
+    if (label) {
+      attrs.set(label, attr);
+    }
+  }
+
+  return attrs;
+}
+
 function runDataloadAndReturnObjects(
   store,
   etype,
@@ -534,11 +570,11 @@ function runDataloadAndReturnObjects(
 ) {
   let idVecs = datalogQuery(store, dq);
 
-  const startCursor = pageInfo?.["start-cursor"];
+  const startCursor = pageInfo?.['start-cursor'];
   const orderAttr = getOrderAttr(store, etype, startCursor, order);
 
-  if (orderAttr && orderAttr?.["forward-identity"]?.[2] !== "id") {
-    const isDate = orderAttr["checked-data-type"] === "date";
+  if (orderAttr && orderAttr?.['forward-identity']?.[2] !== 'id') {
+    const isDate = orderAttr['checked-data-type'] === 'date';
     const a = orderAttr.id;
     idVecs = idVecs.map(([id]) => {
       // order attr is required to be cardinality one, so there will
@@ -552,7 +588,7 @@ function runDataloadAndReturnObjects(
   }
 
   idVecs.sort(
-    direction === "asc"
+    direction === 'asc'
       ? function compareIdVecs(a, b) {
           return compareOrder(a, b);
         }
@@ -562,6 +598,7 @@ function runDataloadAndReturnObjects(
   );
 
   let objects = {};
+  const attrs = objectAttrs(store, etype, dq);
 
   for (const idVec of idVecs) {
     const [id] = idVec;
@@ -576,7 +613,7 @@ function runDataloadAndReturnObjects(
       continue;
     }
 
-    const obj = s.getAsObject(store, etype, id);
+    const obj = s.getAsObject(store, attrs, id);
     if (obj) {
       objects[id] = obj;
     }
@@ -587,10 +624,10 @@ function runDataloadAndReturnObjects(
 function determineOrder(form) {
   const orderOpts = form.$?.order;
   if (!orderOpts) {
-    return "asc";
+    return 'asc';
   }
 
-  return orderOpts[Object.keys(orderOpts)[0]] || "asc";
+  return orderOpts[Object.keys(orderOpts)[0]] || 'asc';
 }
 
 /**
@@ -612,9 +649,10 @@ function resolveObjects(store, { etype, level, form, join, pageInfo }) {
   const before = form.$?.before;
   const after = form.$?.after;
   const order = form.$?.order;
+  const fields = form.$?.fields;
 
   // Wait for server to tell us where we start if we don't start from the beginning
-  if ((offset || before || after) && (!pageInfo || !pageInfo["start-cursor"])) {
+  if ((offset || before || after) && (!pageInfo || !pageInfo['start-cursor'])) {
     return [];
   }
   const where = withJoin(makeWhere(store, etype, level, form.$?.where), join);
@@ -627,7 +665,7 @@ function resolveObjects(store, { etype, level, form, join, pageInfo }) {
     determineOrder(form),
     pageInfo,
     order,
-    { where, find },
+    { where, find, fields },
   );
 
   if (limit != null) {
@@ -681,10 +719,10 @@ function formatPageInfo(pageInfo) {
   const res = {};
   for (const [k, v] of Object.entries(pageInfo)) {
     res[k] = {
-      startCursor: v["start-cursor"],
-      endCursor: v["end-cursor"],
-      hasNextPage: v["has-next-page?"],
-      hasPreviousPage: v["has-previous-page?"],
+      startCursor: v['start-cursor'],
+      endCursor: v['end-cursor'],
+      hasNextPage: v['has-next-page?'],
+      hasPreviousPage: v['has-previous-page?'],
     };
   }
   return res;
@@ -692,7 +730,7 @@ function formatPageInfo(pageInfo) {
 
 export default function query({ store, pageInfo, aggregate }, q) {
   const data = Object.keys(q).reduce(function reduceResult(res, k) {
-    if (aggregate?.[k]) {
+    if (aggregate?.[k] || '$$ruleParams' === k) {
       // Aggregate doesn't return any join rows and has no children,
       // so don't bother querying further
       return res;

@@ -1,17 +1,27 @@
 (ns instant.util.logging-exporter
   "Exporter that logs spans to stdout. In development we also colorize the logs"
   (:require
-   [clojure.tools.logging :as log]
    [clojure.string :as string]
-   [instant.config :as config])
-  (:import (io.opentelemetry.api.common AttributeKey)
-           (io.opentelemetry.sdk.common CompletableResultCode)
-           (io.opentelemetry.sdk.trace.export SpanExporter)
-           (java.util.concurrent TimeUnit)
-           (java.util.concurrent.atomic AtomicBoolean)))
+   [clojure.tools.logging :as log]
+   [instant.config :as config]
+   [instant.flags :as flags]
+   [instant.util.coll :as ucoll])
+  (:import
+   (instant SpanTrackException)
+   (io.opentelemetry.api.common AttributeKey)
+   (io.opentelemetry.api.trace Span SpanId)
+   (io.opentelemetry.sdk.common CompletableResultCode)
+   (io.opentelemetry.sdk.trace.data SpanData
+                                    EventData
+                                    ExceptionEventData)
+   (io.opentelemetry.sdk.trace.export SpanExporter)
+   (java.util.concurrent TimeUnit)
+   (java.util.concurrent.atomic AtomicBoolean)))
 
-;; -------
-;; Colors 
+(set! *warn-on-reflection* true)
+
+;; ------
+;; Colors
 
 (def colors
   "All ansi color codes that look good against black"
@@ -28,45 +38,39 @@
 (defn- error-color [s]
   (format "\033[1;37;41m%s\033[0m" s))
 
-(defn- uniq-color [s]
+(defn- uniq-color [^String s]
   (let [n (.hashCode s)
         i (mod n (count colors))]
     (format "\033[1;38;5;%dm%s\033[0m" (colors i) s)))
 
 (defn colorize [color-f s]
-  (if (= :prod (config/get-env))
+  (if (config/aws-env?)
     s
     (color-f s)))
 
-(defn duration-ms [span]
+(defn duration-ms [^SpanData span]
   (let [start (.getStartEpochNanos span)
         end   (.getEndEpochNanos span)]
-    (.toMillis (TimeUnit/NANOSECONDS)
+    (.toMillis TimeUnit/NANOSECONDS
                (- end start))))
 
-(def exclude-ks #{"SampleRate"
-                  "thread.name"
-                  "thread.id"
-                  "code.lineno"
-                  "code.namespace"
-                  "code.filepath"
-                  "host.name"
-                  "detailed_query"
-                  "detailed_patterns"
-                  "detailed_tx_steps"
-                  "process_id"})
-
-(defn exclude? [[k]]
-  (or (exclude-ks k)
-      ;; `detailed_` columns in our logs are just
-      ;; too noisy. It's still nice to have in honeycomb,
-      ;; but it distracts in stdout.
-      (string/starts-with? k "detailed_")
-      ;; `jvm.` columns are used to associate metrics to
-      ;; every span. This is too noisy for stdout
-      (string/starts-with? k "jvm.")
-      ;; gauge metrics for a namespace
-      (string/starts-with? k "instant.")))
+(defn exclude? [k]
+  (case k
+    ("SampleRate"
+     "thread.name"
+     "thread.id"
+     "code.lineno"
+     "code.namespace"
+     "code.filepath"
+     "host.name"
+     "detailed_query"
+     "detailed_patterns"
+     "detailed_tx_steps"
+     "process_id"
+     "instance_id"
+     "query"
+     "fewer_vfutures") true
+    false))
 
 (defn format-attr-value
   "Formats attr values for logs."
@@ -76,80 +80,153 @@
     clojure.lang.LazySeq (pr-str v)
     v))
 
-(defn attr-str [attrs]
-  (->>  attrs
-        (map (fn [[k v]] [(str k) v]))
-        (remove exclude?)
-        (map (fn [[k v]]
-               (format "%s=%s"
-                       (if (= k "exception.message")
-                         (colorize error-color k)
-                         k)
-                       (format-attr-value v))))
-        (interpose " ")
-        string/join))
+(defn- append-attr [^StringBuilder sb [k v]]
+  (let [k (str k)]
+    (when-not (exclude? k)
+      (.append sb (if (and (= k "exception.message")
+                           (not (config/aws-env?)))
+                    (colorize error-color k)
+                    k))
+      (.append sb "=")
+      (.append sb (format-attr-value v))
+      (.append sb " "))))
 
-(defn event-str [span-event]
-  (attr-str (.asMap (.getAttributes span-event))))
+(defn add-span-tracker-to-exception [^Span span ^Throwable t]
+  (when-not (ucoll/exists?
+             (fn [s] (instance? SpanTrackException s))
+             (.getSuppressed t))
+    (.addSuppressed t (SpanTrackException. (-> span
+                                               (.getSpanContext)
+                                               (.getSpanId))))))
+
+(defn exception-belongs-to-span? [^Throwable t ^SpanId spanId]
+  (ucoll/exists?
+   (fn [t]
+     (and (instance? SpanTrackException t)
+          (= spanId (.getMessage ^SpanTrackException t))))
+   (some-> t .getSuppressed)))
+
+(defn exception-belongs-to-child-span? [^Throwable t ^SpanId spanId]
+  (ucoll/exists?
+   (fn [t]
+     (and (instance? SpanTrackException t)
+          (not= spanId (.getMessage ^SpanTrackException t))))
+   (some-> t .getSuppressed)))
+
+(defn attr-str [^SpanData span]
+  (let [sb (StringBuilder.)]
+    (doseq [attr (.asMap (.getAttributes span))]
+      (append-attr sb attr))
+    (doseq [^EventData event (.getEvents span)]
+      (if (and (instance? ExceptionEventData event)
+               (exception-belongs-to-child-span? (.getException ^ExceptionEventData event) (.getSpanId span)))
+        (append-attr sb ["child-threw-exception" true])
+        (doseq [attr (.asMap (.getAttributes event))]
+          (append-attr sb attr))))
+    (.toString sb)))
 
 (defn friendly-trace [trace-id]
   (if (seq trace-id)
-    (if (= :prod (config/get-env))
+    (if (config/aws-env?)
       trace-id
       (subs trace-id 0 4))
     "unk"))
 
-(defn escape-newlines [s]
-  (string/replace s #"\n" "\\\\n"))
+(defn escape-newlines [^String s]
+  (.replace s "\n" "\\\\n"))
 
-(defn span-str [span]
-  (let [attr-str (attr-str (.getAttributes span))
-        event-strs (map event-str (.getEvents span))
-        data-str (string/join
-                  " "
-                  (into [attr-str] event-strs))]
-    (format "[%s] %sms [%s] %s"
-            (colorize uniq-color (friendly-trace (.getTraceId span)))
-            (duration-ms span)
-            (colorize uniq-color (.getName span))
-            (cond-> data-str
-              (= :prod (config/get-env)) escape-newlines))))
+(def span-str
+  (if (config/aws-env?)
+    (fn [^SpanData span]
+      (let [attr-str (attr-str span)]
+        (format "[%s/%s] %sms [%s] %s"
+                (.getTraceId span)
+                (.getSpanId span)
+                (duration-ms span)
+                (.getName span)
+                (escape-newlines attr-str))))
+    (fn [^SpanData span]
+      (let [attr-str (attr-str span)]
+        (format "[%s] %sms [%s] %s"
+                (colorize uniq-color (friendly-trace (.getTraceId span)))
+                (duration-ms span)
+                (colorize uniq-color (.getName span))
+                attr-str)))))
 
 (def op-attr-key (AttributeKey/stringKey "op"))
+(def app-id-attr-key (AttributeKey/stringKey "app_id"))
 
 (def exclude-span?
-  (if (= :prod (config/get-env))
-    (fn [span]
-      (case (.getName span)
-        ("ws/send-json!"
-         "handle-refresh/send-event!"
-         "store/record-datalog-query-finish!"
-         "store/record-datalog-query-start!"
-         "store/swap-datalog-cache-delay!"
-         "store/bump-instaql-version!"
-         "store/add-instaql-query!") true
+  (if (config/aws-env?)
+    (fn [^SpanData span]
+      (let [n (.getName span)]
+        (case n
+          ("aurora/get-connection"
+           "gc"
+           "gauges"
+           "ws/send-json!"
+           "handle-refresh/send-event!"
+           "store/record-datalog-query-finish!"
+           "store/record-datalog-query-start!"
+           "store/swap-datalog-cache!"
+           "store/bump-instaql-version!"
+           "store/add-instaql-query!"
+           "store/mark-datalog-queries-stale!"
+           "store/remove-query!"
+           "store/assoc-session!"
+           "store/remove-session!"
+           "store/remove-session-data!"
+           "store/upsert-datalog-loader!"
+           "instaql/get-eid-check-result!"
+           "extract-permission-helpers"
+           "instaql/map-permissioned-node"
+           "datalog-query-reactive!"
+           "instaql/preload-entity-maps"
+           "datalog/send-query-nested") true
 
-        ("receive-worker/handle-event"
-         "receive-worker/handle-receive")
-        (case (-> (.getAttributes span)
-                  (.get op-attr-key))
-          (":set-presence"
-           ":refresh-presence"
-           ":server-broadcast"
-           ":client-broadcast") true
+          ("receive-worker/handle-event"
+           "receive-worker/handle-receive")
+          (case (-> (.getAttributes span)
+                    (.get op-attr-key))
+            (":set-presence"
+             ":refresh-presence"
+             ":server-broadcast"
+             ":client-broadcast") true
 
-          false)
+            false)
 
-        false))
-    (fn [_span]
-      false)))
+          (string/starts-with? n "e2e"))))
+    (fn [^SpanData span]
+      (let [n (.getName span)]
+        (case n
+          ("gc"
+           "gauges") true
+
+          (string/starts-with? n "e2e"))))))
+
+(defn include-span? [^SpanData span]
+  (let [name (.getName span)]
+    (= "postmark/send-disabled" name)))
+
+(def log-spans?
+  (not= "false" (System/getenv "INSTANT_LOG_SPANS")))
+
+(defn should-log? [^SpanData span]
+  (if-let [app-id (-> span .getAttributes (.get app-id-attr-key))]
+    (if-let [sample-rate (flags/log-sampled-apps app-id)]
+      (<= (rand) sample-rate)
+      true)  ; App ID not in config, always log
+    true))  ; No app ID, always log
 
 (defn log-spans [spans]
   (doseq [span spans
-          :when (not (exclude-span? span))]
+          :when (or (include-span? span)
+                    (and log-spans?
+                         (should-log? span)
+                         (not (exclude-span? span))))]
     (log/info (span-str span))))
 
-(defn export [shutdown? spans]
+(defn export [^AtomicBoolean shutdown? spans]
   (if (.get shutdown?)
     (CompletableResultCode/ofFailure)
     (do (log-spans spans)

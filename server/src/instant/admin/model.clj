@@ -30,7 +30,7 @@
 
 (defn lookup? [eid]
   (and (string? eid)
-       (.startsWith eid "lookup__")))
+       (string/starts-with? eid "lookup__")))
 
 (defn parse-lookup [^String k]
   (let [[_ eid & json-parts] (.split k "__")]
@@ -65,7 +65,7 @@
 (defn ref-lookup? [attrs etype [ident-name _value]]
   ;; attr names can have `.` in them, so check for the attr with a `.` before
   ;; assuming it's a ref
-  (and (not= (.indexOf ident-name ".") -1)
+  (and (string/index-of ident-name ".")
        (not (attr-model/seek-by-fwd-ident-name [etype ident-name] attrs))))
 
 (defn extract-ref-lookup-fwd-name [lookup]
@@ -92,81 +92,116 @@
       [(:id attr) value])
     eid))
 
-(defn expand-link [attrs [etype eid-a obj]]
-  (mapcat (fn [[label eid-or-eids]]
-            (let [fwd-attr (attr-model/seek-by-fwd-ident-name [etype label] attrs)
-                  rev-attr (attr-model/seek-by-rev-ident-name [etype label] attrs)
-                  eid-bs (if (coll? eid-or-eids) eid-or-eids [eid-or-eids])
-                  tx-steps (map (fn [eid-b]
-                                  (if fwd-attr
-                                    [:add-triple
-                                     (extract-lookup attrs etype eid-a)
-                                     (:id fwd-attr)
-                                     (extract-lookup attrs
-                                                     (-> fwd-attr
-                                                         :reverse-identity
-                                                         second)
-                                                     eid-b)]
-                                    [:add-triple
-                                     (extract-lookup attrs
-                                                     (-> rev-attr
-                                                         :forward-identity
-                                                         second)
-                                                     eid-b)
-                                     (:id rev-attr)
-                                     (extract-lookup attrs etype eid-a)]))
-                                eid-bs)]
+(defn- with-id-attr-for-lookup [attrs etype eid steps]
+  (let [lookup (extract-lookup attrs etype  eid)]
+    (if-not (sequential? lookup)
+      steps
+      (into [[:add-triple
+              lookup
+              (:id (attr-model/seek-by-fwd-ident-name [etype "id"] attrs))
+              lookup]]
+            steps))))
 
-              tx-steps))
-          obj))
+(defn expand-link [attrs [etype eid-a obj]]
+  (with-id-attr-for-lookup
+    attrs etype eid-a
+    (mapcat (fn [[label eid-or-eids]]
+              (let [fwd-attr (attr-model/seek-by-fwd-ident-name [etype label] attrs)
+                    rev-attr (attr-model/seek-by-rev-ident-name [etype label] attrs)
+                    eid-bs (if (coll? eid-or-eids) eid-or-eids [eid-or-eids])
+                    tx-steps (map (fn [eid-b]
+                                    (if fwd-attr
+                                      [:add-triple
+                                       (extract-lookup attrs etype eid-a)
+                                       (:id fwd-attr)
+                                       (extract-lookup attrs
+                                                       (-> fwd-attr
+                                                           :reverse-identity
+                                                           second)
+                                                       eid-b)]
+                                      [:add-triple
+                                       (extract-lookup attrs
+                                                       (-> rev-attr
+                                                           :forward-identity
+                                                           second)
+                                                       eid-b)
+                                       (:id rev-attr)
+                                       (extract-lookup attrs etype eid-a)]))
+                                  eid-bs)]
+
+                tx-steps))
+            obj)))
 
 (defn expand-unlink [attrs [etype eid-a obj]]
-  (mapcat (fn [[label eid-or-eids]]
-            (let [fwd-attr (attr-model/seek-by-fwd-ident-name [etype label] attrs)
-                  rev-attr (attr-model/seek-by-rev-ident-name [etype label] attrs)
-                  eid-bs (if (coll? eid-or-eids) eid-or-eids [eid-or-eids])
-                  tx-steps (map (fn [eid-b]
-                                  (if fwd-attr
-                                    [:retract-triple
-                                     (extract-lookup attrs etype eid-a)
-                                     (:id fwd-attr)
-                                     (extract-lookup attrs
-                                                     (-> fwd-attr
-                                                         :reverse-identity
-                                                         second)
-                                                     eid-b)]
-                                    [:retract-triple
-                                     (extract-lookup attrs
-                                                     (-> rev-attr
-                                                         :forward-identity
-                                                         second)
-                                                     eid-b)
-                                     (:id rev-attr)
-                                     (extract-lookup attrs etype eid-a)]))
-                                eid-bs)]
-              tx-steps))
-          obj))
+  (with-id-attr-for-lookup attrs etype eid-a
+    (mapcat (fn [[label eid-or-eids]]
+              (let [fwd-attr (attr-model/seek-by-fwd-ident-name [etype label] attrs)
+                    rev-attr (attr-model/seek-by-rev-ident-name [etype label] attrs)
+                    eid-bs (if (coll? eid-or-eids) eid-or-eids [eid-or-eids])
+                    tx-steps (map (fn [eid-b]
+                                    (if fwd-attr
+                                      [:retract-triple
+                                       (extract-lookup attrs etype eid-a)
+                                       (:id fwd-attr)
+                                       (extract-lookup attrs
+                                                       (-> fwd-attr
+                                                           :reverse-identity
+                                                           second)
+                                                       eid-b)]
+                                      [:retract-triple
+                                       (extract-lookup attrs
+                                                       (-> rev-attr
+                                                           :forward-identity
+                                                           second)
+                                                       eid-b)
+                                       (:id rev-attr)
+                                       (extract-lookup attrs etype eid-a)]))
+                                  eid-bs)]
+                tx-steps))
+            obj)))
 
-(defn expand-update [attrs [etype eid obj]]
-  (let [lookup (extract-lookup attrs etype eid)]
+(defn convert-opts [opts]
+  (cond-> nil
+    (some? (get opts "upsert"))
+    (assoc :mode (if (get opts "upsert") :upsert :update))))
+
+(defn expand-create [attrs [etype eid obj]]
+  (let [lookup (extract-lookup attrs etype eid)
+        opts'  {:mode :create}]
     (map (fn [[label value]]
            (let [attr (attr-model/seek-by-fwd-ident-name [etype label] attrs)]
-             [:add-triple lookup (:id attr) value]))
+             [:add-triple lookup (:id attr) value opts']))
          ;; id first so that we don't clobber updates on the lookup field
          (concat [["id" lookup]] obj))))
 
-(defn expand-merge [attrs [etype eid obj]]
-  (let [lookup (extract-lookup attrs etype eid)]
+(defn expand-update [attrs [etype eid obj opts]]
+  (let [lookup (extract-lookup attrs etype eid)
+        opts'  (convert-opts opts)]
+    (map (fn [[label value]]
+           (let [attr (attr-model/seek-by-fwd-ident-name [etype label] attrs)]
+             (cond-> [:add-triple lookup (:id attr) value]
+               opts' (conj opts'))))
+         ;; id first so that we don't clobber updates on the lookup field
+         (concat [["id" lookup]] obj))))
+
+(defn expand-merge [attrs [etype eid obj opts]]
+  (let [lookup (extract-lookup attrs etype eid)
+        opts'  (convert-opts opts)]
     (map (fn [[label value]]
            (let [attr (attr-model/seek-by-fwd-ident-name [etype label] attrs)
                  op (if (= label "id") :add-triple :deep-merge-triple)]
-             [op lookup (:id attr) value]))
+             (cond-> [op lookup (:id attr) value]
+               opts' (conj opts'))))
          ;; id first so that we don't clobber updates on the lookup field
          (concat [["id" lookup]] obj))))
 
 (defn expand-delete [attrs [etype eid]]
   (let [lookup (extract-lookup attrs etype eid)]
     [[:delete-entity lookup etype]]))
+
+(defn expand-rule-params [attrs [etype eid params]]
+  (let [lookup (extract-lookup attrs etype eid)]
+    [[:rule-params lookup etype params]]))
 
 (defn expand-add-attr [_ [attr]]
   [[:add-attr (-> attr
@@ -177,20 +212,27 @@
 (defn expand-delete-attr [_ [id]]
   [[:delete-attr id]])
 
-(defn remove-id-from-step [[op etype eid obj]]
-  [op etype eid (dissoc obj "id")])
+(defn remove-id-from-step [[op etype eid obj opts]]
+  (cond-> [op etype eid (dissoc obj "id")]
+    opts (conj opts)))
 
 (defn to-tx-steps [attrs step]
   (let [[action & args] (remove-id-from-step step)]
     (case action
+      "create" (expand-create attrs args)
       "update" (expand-update attrs args)
       "merge" (expand-merge attrs args)
       "link"   (expand-link attrs args)
       "unlink" (expand-unlink attrs args)
       "delete" (expand-delete attrs args)
+      "ruleParams" (expand-rule-params attrs args)
       "add-attr" (expand-add-attr attrs args)
       "delete-attr" (expand-delete-attr attrs args)
-      (throw (ex-info (str "unsupported action " action) {})))))
+      (ex/throw-validation-err!
+       :action
+       action
+       [{:message (str "Unsupported action " action)
+         :hint {:value action}}]))))
 
 (defn create-object-attr
   ([etype label] (create-object-attr etype label nil))
@@ -224,9 +266,9 @@
             props))))
 
 (def obj-actions #{"link" "unlink" "update" "merge"})
-(def update-actions #{"update", "merge"})
+(def update-actions #{"create" "update" "merge"})
 (def ref-actions #{"link" "unlink"})
-(def supports-lookup-actions #{"link" "unlink" "update" "merge" "delete"})
+(def supports-lookup-actions #{"link" "unlink" "create" "update" "merge" "delete"})
 
 (defn add-attr [{:keys [attrs add-ops]} attr]
   {:attrs (conj attrs attr)
@@ -357,11 +399,21 @@
 (s/def ::lookup (s/or :entity-id coercible-uuid?
                       :lookup-ref ::lookup-ref))
 
+(s/def ::upsert
+  (s/nilable boolean?))
+
+(s/def ::update-opts
+  (s/nilable
+   (s/keys :opt-un [::upsert])))
+
+(s/def ::create-op
+  (s/cat :op #{"create"} :args (s/cat :etype string? :eid ::lookup :args map?)))
+
 (s/def ::update-op
-  (s/cat :op #{"update"} :args (s/cat :etype string? :eid ::lookup :args map?)))
+  (s/cat :op #{"update"} :args (s/cat :etype string? :eid ::lookup :args map? :opts (s/? ::update-opts))))
 
 (s/def ::merge-op
-  (s/cat :op #{"merge"} :args (s/cat :etype string? :eid ::lookup :args map?)))
+  (s/cat :op #{"merge"} :args (s/cat :etype string? :eid ::lookup :args map? :opts (s/? ::update-opts))))
 
 (s/def ::link-value (s/or :eid ::lookup :eids (s/coll-of ::lookup)))
 
@@ -376,6 +428,9 @@
 (s/def ::delete-op
   (s/cat :op #{"delete"} :args (s/cat :etype string? :eid ::lookup :remaining-args (s/* (constantly true)))))
 
+(s/def ::rule-params-op
+  (s/cat :op #{"ruleParams"} :args (s/cat :etype string? :eid ::lookup :args map?)))
+
 (s/def ::add-attr-op
   (s/cat :op #{"add-attr"} :attr map?))
 
@@ -389,11 +444,13 @@
   (s/cat :op #{"delete-attr"} :eid coercible-uuid?))
 
 (s/def ::op (s/or
+             :create ::create-op
              :update ::update-op
              :merge ::merge-op
              :link ::link-op
              :unlink ::unlink-op
              :delete ::delete-op
+             :rule-params ::rule-params-op
              :add-attr ::add-attr-op
              :update-attr ::update-attr-op
              :delete-attr ::delete-attr-op))

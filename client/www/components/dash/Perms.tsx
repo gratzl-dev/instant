@@ -6,15 +6,19 @@ import { errorToast, successToast } from '@/lib/toast';
 import config from '@/lib/config';
 import { jsonFetch } from '@/lib/fetch';
 import { TokenContext } from '@/lib/contexts';
-import { InstantApp, DashResponse } from '@/lib/types';
+import { InstantApp, DashResponse, SchemaNamespace } from '@/lib/types';
 import { Button, Content, JSONEditor, SectionHeading } from '@/components/ui';
 import { HomeButton } from '@/pages/dash';
+import { InstantReactWebDatabase } from '@instantdb/react';
+import { useSchemaQuery } from '@/lib/hooks/explorer';
 
 export function Perms({
   app,
+  db,
   dashResponse,
 }: {
   app: InstantApp;
+  db: InstantReactWebDatabase<any>;
   dashResponse: SWRResponse<DashResponse>;
 }) {
   const [errorRes, setErrorRes] = useState<{
@@ -26,9 +30,13 @@ export function Perms({
     return app.rules ? JSON.stringify(app.rules, null, 2) : '';
   }, [app]);
 
+  const { namespaces } = useSchemaQuery(db);
+
+  const schema = rulesSchema(namespaces);
+
   return (
-    <div className="flex flex-1 flex-col md:flex-row">
-      <div className="flex flex-col gap-4 border-r p-4 text-sm md:basis-96 md:text-base">
+    <div className="flex flex-1 flex-col md:flex-row min-h-0">
+      <div className="flex flex-col gap-4 border-r p-4 text-sm md:basis-96 md:text-base min-h-0">
         <SectionHeading>Permissions</SectionHeading>
         <Content>
           <p>
@@ -69,10 +77,10 @@ export function Perms({
             </>
           }
           value={value}
-          schema={rulesSchema}
+          schema={schema}
           onSave={async (r) => {
             const er = await onEditRules(dashResponse, app.id, r, token).catch(
-              (error) => error
+              (error) => error,
             );
             setErrorRes(er);
           }}
@@ -86,7 +94,7 @@ async function onEditRules(
   dashResponse: SWRResponse<any, any, any>,
   appId: string,
   newRules: string,
-  token: string
+  token: string,
 ): Promise<void> {
   if (dashResponse.error || dashResponse.isLoading) {
     return Promise.reject(null);
@@ -133,7 +141,7 @@ async function onEditRules(
       }
       errorToast(
         "Oh no, we weren't able to save these rules. Please try again or ping us on Discord if you're stuck!",
-        { autoClose: 3000 }
+        { autoClose: 3000 },
       );
       return Promise.reject();
     });
@@ -150,32 +158,48 @@ function updateRules(token: string, appId: string, newRulesObj: object) {
   });
 }
 
-export const rulesSchema = {
-  type: 'object',
-  patternProperties: {
-    '^[$a-zA-Z0-9_\\-]+$': {
-      type: 'object',
-      properties: {
-        allow: {
-          type: 'object',
-          properties: {
-            create: { type: 'string' },
-            update: { type: 'string' },
-            delete: { type: 'string' },
-            view: { type: 'string' },
-            $default: { type: 'string' },
-          },
-          additionalProperties: false,
+const rulesSchema = (namespaces: SchemaNamespace[] | null) => {
+  const ruleBlock = {
+    type: 'object',
+    properties: {
+      allow: {
+        type: 'object',
+        properties: {
+          create: { type: 'string' },
+          update: { type: 'string' },
+          delete: { type: 'string' },
+          view: { type: 'string' },
+          $default: { type: 'string' },
         },
-        bind: {
-          type: 'array',
-          // Use a combination of "items" and "additionalItems" for validation
-          items: { type: 'string' },
-          minItems: 2,
-        },
+        additionalProperties: false,
       },
-      additionalProperties: false,
+      bind: {
+        type: 'array',
+        // Use a combination of "items" and "additionalItems" for validation
+        items: { type: 'string' },
+        minItems: 2,
+      },
     },
-  },
-  additionalProperties: false,
+    additionalProperties: false,
+  };
+
+  const properties: Record<string, typeof ruleBlock> = {
+    $default: ruleBlock,
+    attrs: ruleBlock,
+  };
+
+  if (namespaces) {
+    for (const namespace of namespaces) {
+      properties[namespace.name] = ruleBlock;
+    }
+  }
+
+  return {
+    type: 'object',
+    properties,
+    patternProperties: {
+      '^[$a-zA-Z0-9_\\-]+$': ruleBlock,
+    },
+    additionalProperties: false,
+  };
 };

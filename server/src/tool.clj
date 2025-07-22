@@ -1,22 +1,21 @@
 (ns tool
-  "Handy functions to use when you're in the REPL. 
-   
-   This is required in the `core` namespace, so you can use it anywhere. 
+  "Handy functions to use when you're in the REPL.
 
-   The most popular: 
+   This is required in the `core` namespace, so you can use it anywhere.
+
+   The most popular:
      (tool/def-locals)
-     (tool/copy) 
+     (tool/copy)
      (tool/hsql-pretty ...) and more!"
   (:require
    [clojure.string :as str]
-   [clojure.walk :as walk]
    [honey.sql :as hsql]
-   [portal.api :as p])
+   [portal.api :as p]
+   [clj-async-profiler.core :as prof])
   (:import
-   (clojure.lang Compiler TaggedLiteral)
    (com.github.vertical_blank.sqlformatter SqlFormatter)
-   (java.awt Toolkit)
-   (java.awt.datatransfer StringSelection)))
+   (com.zaxxer.hikari HikariDataSource)
+   (java.util UUID)))
 
 (defmacro def-locals*
   [prefix]
@@ -93,24 +92,67 @@
            [:bar {:select :* :from :bar}]]
     :select :* :from :bar}))
 
+
+;; Copied from sql.clj
+(defn ->pg-text-array
+  "Formats as text[] in pg, i.e. {item-1, item-2, item3}"
+  [col]
+  (format
+   "{%s}"
+   (str/join
+    ","
+    (map (fn [s] (format "\"%s\""
+                         ;; Escape quotes (but don't double esc)
+                         (str/replace s #"(?<!\\)\"" "\\\"")))
+         col))))
+
+;; Copied from sql.clj
+(defn ->pg-uuid-array
+  "Formats as uuid[] in pg, i.e. {item-1, item-2, item3}"
+  [uuids]
+  (let [s (StringBuilder. "{")]
+    (doseq [^UUID uuid uuids]
+      (when (not= 1 (.length s))
+        (.append s \,))
+      (.append s (.toString uuid)))
+    (.append s "}")
+    (.toString s)))
+
 (defn unsafe-sql-format-query
   "Use with caution: this inlines parameters in the query, so it could
    be used with sql injection.
    Useful for running queries in psql"
   [[q & params]]
   (let [idx (atom 0)]
-    (sql-pretty
-     (clojure.string/replace q
-                             #"\?"
-                             (fn [_] (let [i @idx
-                                           v (nth params i)]
-                                       (swap! idx inc)
-                                       (str (if (int? v)
-                                              (format "%s" v)
-                                              (format "'%s'" v))
-                                            (if (uuid? v)
-                                              "::uuid"
-                                              ""))))))))
+    (-> q
+        (clojure.string/replace #"\?"
+                                (fn [_] (let [i @idx
+                                              v (nth params i)]
+                                          (swap! idx inc)
+                                          (str (cond
+                                                 (int? v) (format "%s" v)
+                                                 (string? v) (format "'%s'" (-> ^String v
+                                                                                (.replace "'" "''")))
+                                                 (= "uuid[]"
+                                                    (-> v
+                                                        meta
+                                                        :pgtype)) (format "'%s'"
+                                                    (->pg-uuid-array v))
+
+                                                 (= "text[]"
+                                                    (-> v
+                                                        meta
+                                                        :pgtype)) (format "'%s'"
+                                                    (->pg-text-array v))
+                                                 (and (set? v)
+                                                      (every? uuid? v)) (format "'%s'" (->pg-uuid-array v))
+                                                 :else (format "'%s'" v))
+                                               (if (uuid? v)
+                                                 "::uuid"
+                                                 "")))))
+        ^String sql-pretty
+        ;; Fix a bug with the pretty printer where the || operator gets a space
+        (.replace "| |" "||"))))
 
 (defn unsafe-hsql-format
   "Use with caution: this inlines parameters in the query, so it could
@@ -128,12 +170,21 @@
          " -d \"" param-str "\"")))
 
 (defn copy
-  "Stringifies the argument and copies it to the clipboard."
+  "Stringifies the argument and copies it to the clipboard"
   [x]
-  (.. Toolkit
-      (getDefaultToolkit)
-      (getSystemClipboard)
-      (setContents (StringSelection. (str x)) nil)))
+  (let [pb (ProcessBuilder. ["pbcopy"])
+        p (.start pb)
+        os (.getOutputStream p)]
+    (.write os (.getBytes (str x)))
+    (.close os)
+    (.waitFor p)
+    x))
+
+(defn copy-quiet
+  "Stringifies the argument and copies it to the clipboard"
+  [x]
+  (copy x)
+  nil)
 
 (def ^:dynamic *time-tracker* nil)
 
@@ -154,48 +205,93 @@
                                      (assoc-in [~label :avg] avg#))))))
      ret#))
 
+(def ^:dynamic *time-indent*
+  "")
+
+(def time-enabled?
+  false)
+
+(defmacro time* [msg & body]
+  (if time-enabled?
+    `(let [msg# ~msg
+           t#   (System/nanoTime)
+           res# (binding [*time-indent* (str "┌╴" *time-indent*)]
+                  ~@body)
+           dt#  (-> (System/nanoTime) (- t#) (/ 1000000.0))]
+       (println (format "%s[ %8.3f ms ] %s" *time-indent* dt# msg#))
+       res#)
+    (cons 'do body)))
+
+(defn copy-unsafe-sql-format-query
+  "Formats the [sql, ...params] query as sql and copies it to the clipboard,
+   returning the query as something that portal will display nicely."
+  [query]
+  (with-meta [(copy (unsafe-sql-format-query query))]
+    {:portal.viewer/default :tool/sql-query}))
+
+;; Adds a :tool/sql-query viewer
+(def portal-sql-query-viewer "
+  (require '[portal.ui.api :as p])
+  (require '[portal.ui.inspector :as ins])
+  (require '[portal.ui.viewer.text :as text])
+  (require '[portal.ui.commands :as cmd])
+
+
+  (p/register-viewer!
+   {:name :tool/sql-query
+    :predicate (fn [x] (and (vector? x) (string? (first x))))
+    :component (fn [query]
+                 [:<>
+                  [text/inspect-text (first query)]])})")
+
 (defn start-portal!
   "Lets you inspect data using Portal.
 
    (start-portal!)
    ;; all tap> calls will be sent to portal
-   (tap> @instant.reactive.store/store-conn)
+   (tap> @instant.reactive.store/store)
 
    For a guide, see:
    https://www.youtube.com/watch?v=Tj-iyDo3bq0"
   []
   (def portal (p/open))
-  (add-tap #'p/submit))
+  (add-tap #'p/submit)
+  (p/register! #'copy-unsafe-sql-format-query)
+  (p/eval-str portal portal-sql-query-viewer))
 
 (comment
   (start-portal!)
   (tap> {:hello [1 2 3]}))
 
-(def ^:private p-lock
-  (Object.))
+(defmacro inspect
+  "prints the expression '<name> is <value>', and returns the value"
+  [value]
+  `(do
+     (let [name# (quote ~value)
+           result# ~value]
+       (println (pr-str name#) "is" (pr-str result#))
+       result#)))
 
-(defn p-pos []
-  (let [trace (->> (Thread/currentThread)
-                   (.getStackTrace)
-                   (seq))
-        el    ^StackTraceElement (nth trace 4)]
-    (str "[" (Compiler/demunge (.getClassName el)) " " (.getFileName el) ":" (.getLineNumber el) "]")))
+(defmacro profile [options? & body]
+  `(prof/profile ~options? ~body))
 
-(defn p-impl [position form res]
-  (let [form (walk/postwalk
-              (fn [form]
-                (if (and
-                     (list? form)
-                     (= 'tool/p-impl (first form)))
-                  (TaggedLiteral/create 'p (nth form 3))
-                  form))
-              form)]
-    (locking p-lock
-      (println (str position " #p " form " => " (pr-str res))))
-    res))
+(def prof-serve-ui prof/serve-ui)
 
-(defn p
-  "Add #p before any form to quickly print its value to output next time
-   it is evaluated. Dev only"
-  [form]
-  `(p-impl (p-pos) '~form ~form))
+(defmacro bench [& body]
+  `(do
+     (require 'criterium.core)
+     (criterium.core/quick-bench ~@body)
+     (flush)))
+
+(defmacro with-prod-conn
+  "Usage: (with-prod-conn [my-conn]
+            (sql/select my-conn [\"select 1\"]))"
+  [[conn-name] & body]
+  `(let [cluster-id# (-> (clojure.java.io/resource "config/prod.edn")
+                         slurp
+                         clojure.edn/read-string
+                         :database-cluster-id)
+         rds-cluster-id->db-config# (requiring-resolve 'instant.aurora-config/rds-cluster-id->db-config)
+         start-pool# (requiring-resolve 'instant.jdbc.aurora/start-pool)]
+     (with-open [~conn-name ^HikariDataSource (start-pool# 1 (rds-cluster-id->db-config# cluster-id#))]
+       ~@body)))

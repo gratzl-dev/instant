@@ -12,6 +12,17 @@ node_modules
 www/.next/
 www/out/
 
+# sitemap
+client/www/public/sitemap.xml
+
+# llms
+client/www/public/llms.txt
+client/www/public/llms-full.txt
+
+# static docs
+client/www/public/docs
+client/www/public/docs*
+
 # production
 www/build
 
@@ -97,6 +108,10 @@ web_modules/
 # Optional npm cache directory
 .npm
 
+# tshy
+.tshy
+.tshy-build
+
 # Optional eslint cache
 .eslintcache
 
@@ -119,7 +134,7 @@ web_modules/
 .yarn-integrity
 
 # dotenv environment variable files
-.env
+client/sandbox/**/.env
 .env.development.local
 .env.test.local
 .env.production.local
@@ -194,3 +209,7 @@ server/resources/metrics/*-usage.png
 
 # emails
 server/resources/emails/*
+
+# algolia 
+client/www/scripts/algolia-objects.json
+client/packages/mcp/.env

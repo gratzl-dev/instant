@@ -1,12 +1,26 @@
 import { init, InstantReactWebDatabase } from '@instantdb/react';
-import { useContext, useEffect, useMemo, useState } from 'react';
+import { useContext, useEffect, useRef, useState } from 'react';
 import { v4 } from 'uuid';
 import produce from 'immer';
 import Head from 'next/head';
 import NextLink from 'next/link';
 import { useRouter } from 'next/router';
 import { capitalize } from 'lodash';
-import { PlusIcon, TrashIcon } from '@heroicons/react/solid';
+import {
+  ArrowLeftIcon,
+  ChevronDownIcon,
+  Cog6ToothIcon,
+  PlusIcon,
+  TrashIcon,
+} from '@heroicons/react/24/solid';
+import { ArrowTopRightOnSquareIcon } from '@heroicons/react/24/outline';
+import {
+  Combobox,
+  ComboboxButton,
+  ComboboxInput,
+  ComboboxOption,
+  ComboboxOptions,
+} from '@headlessui/react';
 
 import { StyledToastContainer, errorToast, successToast } from '@/lib/toast';
 import config, { cliOauthParamName, getLocal, setLocal } from '@/lib/config';
@@ -15,14 +29,14 @@ import {
   APIResponse,
   signOut,
   useAuthToken,
-  useAuthedFetch,
   claimTicket,
   voidTicket,
 } from '@/lib/auth';
 import { TokenContext } from '@/lib/contexts';
-import { DashResponse, DBAttr, InstantApp, InstantMember } from '@/lib/types';
+import { DashResponse, InstantApp, InstantMember } from '@/lib/types';
 
 import { Perms } from '@/components/dash/Perms';
+import { Schema } from '@/components/dash/Schema';
 import Auth from '@/components/dash/Auth';
 import { Explorer } from '@/components/dash/explorer/Explorer';
 import { Onboarding } from '@/components/dash/Onboarding';
@@ -35,13 +49,14 @@ import {
   Content,
   Copyable,
   Dialog,
+  FullscreenLoading,
   Label,
   ScreenHeading,
   SectionHeading,
   Select,
   SubsectionHeading,
   TabBar,
-  TabBarTab,
+  TabItem,
   TextInput,
   ToggleCollection,
   twel,
@@ -49,14 +64,18 @@ import {
 } from '@/components/ui';
 import { AppAuth } from '@/components/dash/AppAuth';
 import Billing from '@/components/dash/Billing';
-import { useIsHydrated } from '@/lib/hooks/useIsHydrated';
 import { QueryInspector } from '@/components/dash/explorer/QueryInspector';
 import { Sandbox } from '@/components/dash/Sandbox';
-import { StorageTab } from '@/components/dash/Storage';
 import PersonalAccessTokensScreen from '@/components/dash/PersonalAccessTokensScreen';
 import { useForm } from '@/lib/hooks/useForm';
-import { useSchemaQuery } from '@/lib/hooks/explorer';
 import useLocalStorage from '@/lib/hooks/useLocalStorage';
+import { useDashFetch } from '@/lib/hooks/useDashFetch';
+import { asClientOnlyPage, useReadyRouter } from '@/components/clientOnlyPage';
+import { createdAtComparator } from '@/lib/app';
+import OAuthApps from '@/components/dash/OAuthApps';
+import clsx from 'clsx';
+import AuthorizedOAuthAppsScreen from '@/components/dash/AuthorizedOAuthAppsScreen';
+import { useNamespacesQuery, useSchemaQuery } from '@/lib/hooks/explorer';
 
 // (XXX): we may want to expose this underlying type
 type InstantReactClient = ReturnType<typeof init>;
@@ -65,11 +84,10 @@ type Role = 'collaborator' | 'admin' | 'owner';
 
 const roleOrder = ['collaborator', 'admin', 'owner'] as const;
 
-const defaultTab: TabId = 'home';
-
-type TabId =
+type MainTabId =
   | 'home'
   | 'explorer'
+  | 'schema'
   | 'repl'
   | 'sandbox'
   | 'perms'
@@ -78,30 +96,56 @@ type TabId =
   | 'team'
   | 'admin'
   | 'billing'
-  | 'storage'
-  | 'docs';
+  | 'docs'
+  | 'oauth-apps';
 
-interface Tab {
+type UserSettingsTabId = 'pat' | 'oauth-apps';
+
+type Screen =
+  | 'main'
+  | 'user-settings'
+  | 'personal-access-tokens'
+  | 'new'
+  | 'invites';
+
+function defaultTab(screen: 'main'): MainTabId;
+function defaultTab(screen: 'user-settings'): UserSettingsTabId;
+function defaultTab(screen: Screen): MainTabId | UserSettingsTabId;
+function defaultTab(screen: Screen): MainTabId | UserSettingsTabId {
+  if (screen === 'user-settings') {
+    return 'oauth-apps';
+  }
+  return 'home';
+}
+
+interface Tab<TabId> {
   id: TabId;
   title: string;
   icon?: React.ReactNode;
   minRole?: 'admin' | 'owner';
 }
 
-const tabs: Tab[] = [
+const mainTabs: Tab<MainTabId>[] = [
   { id: 'home', title: 'Home' },
   { id: 'explorer', title: 'Explorer' },
+  { id: 'schema', title: 'Schema' },
   { id: 'perms', title: 'Permissions' },
   { id: 'auth', title: 'Auth' },
-  { id: 'storage', title: 'Storage' },
   { id: 'repl', title: 'Query Inspector' },
   { id: 'sandbox', title: 'Sandbox' },
   { id: 'admin', title: 'Admin', minRole: 'admin' },
   { id: 'billing', title: 'Billing' },
   { id: 'docs', title: 'Docs' },
+  { id: 'oauth-apps', title: 'OAuth Apps' },
 ];
 
-const tabIndex = new Map(tabs.map((t) => [t.id, t]));
+const userTabs: Tab<UserSettingsTabId>[] = [
+  { id: 'oauth-apps', title: 'OAuth Apps' },
+  { id: 'pat', title: 'Access Tokens' },
+];
+
+const mainTabIndex = new Map(mainTabs.map((t) => [t.id, t]));
+const userTabIndex = new Map(userTabs.map((t) => [t.id, t]));
 
 export function isMinRole(minRole: Role, role: Role) {
   return roleOrder.indexOf(role) >= roleOrder.indexOf(minRole);
@@ -109,15 +153,20 @@ export function isMinRole(minRole: Role, role: Role) {
 
 // COMPONENTS
 
-export default function DashV2() {
+const Dash = asClientOnlyPage(DashV2);
+
+export default Dash;
+
+function DashV2() {
   const token = useAuthToken();
-  const isHydrated = useIsHydrated();
-  const router = useRouter();
+  const readyRouter = useRouter();
   const cliAuthCompleteDialog = useDialog();
   const [loginTicket, setLoginTicket] = useState<string | undefined>();
 
-  const cliNormalTicket = router.query.ticket as string | undefined;
-  const cliOauthTicket = router.query[cliOauthParamName] as string | undefined;
+  const cliNormalTicket = readyRouter.query.ticket as string | undefined;
+  const cliOauthTicket = readyRouter.query[cliOauthParamName] as
+    | string
+    | undefined;
   const cliTicket = cliNormalTicket || cliOauthTicket;
   useEffect(() => {
     if (cliTicket) setLoginTicket(cliTicket);
@@ -136,10 +185,6 @@ export default function DashV2() {
     } catch (error) {
       errorToast('Error completing CLI login.');
     }
-  }
-
-  if (!isHydrated) {
-    return null;
   }
 
   if (!token) {
@@ -181,7 +226,7 @@ export default function DashV2() {
               onClick={() => {
                 try {
                   window.close();
-                } catch (error) { }
+                } catch (error) {}
                 cliAuthCompleteDialog.onClose();
               }}
             >
@@ -232,17 +277,25 @@ export default function DashV2() {
   );
 }
 
-function isTabAvailable(tab: Tab, role?: Role) {
+function isTabAvailable(tab: Tab<MainTabId>, role?: Role) {
   return tab.minRole ? role && isMinRole(tab.minRole, role) : true;
+}
+
+function screenTab(screen: Screen, tab: string | null | undefined) {
+  if (screen === 'user-settings') {
+    return tab && userTabIndex.has(tab as UserSettingsTabId)
+      ? tab
+      : defaultTab('user-settings');
+  }
+  return tab && mainTabIndex.has(tab as MainTabId) ? tab : defaultTab(screen);
 }
 
 function Dashboard() {
   const token = useContext(TokenContext);
-  const router = useRouter();
+  const router = useReadyRouter();
   const appId = router.query.app as string;
-  const screen = (router.query.s as string) || 'main';
-  const _tab = router.query.t as TabId;
-  const tab = tabIndex.has(_tab) ? _tab : defaultTab;
+  const screen = ((router.query.s as string) || 'main') as Screen;
+  const tab = screenTab(screen, router.query.t as string);
 
   // Local states
   const [hideAppId, setHideAppId] = useLocalStorage('hide_app_id', false);
@@ -251,7 +304,13 @@ function Dashboard() {
     db: InstantReactClient;
   } | null>(null);
 
-  const dashResponse = useAuthedFetch<DashResponse>(`${config.apiURI}/dash`);
+  const dashResponse = useDashFetch();
+
+  const [agentEssayDemo, setAgentEssayDemo] = useLocalStorage<{
+    appId?: string;
+    adminToken?: string;
+    claimed?: boolean;
+  }>('agents-essay-demo', {});
 
   useEffect(() => {
     if (!token) return;
@@ -271,41 +330,35 @@ function Dashboard() {
     });
   }, [token]);
 
-  const apps = useMemo(() => {
-    const apps = [...(dashResponse.data?.apps ?? [])];
-    apps.sort(caComp);
-    return apps;
-  }, [dashResponse.data?.apps]);
-  const app = apps?.find((a) => a.id === appId);
-  const isStorageEnabled = useMemo(() => {
-    const storageEnabledAppIds =
-      dashResponse.data?.flags?.storage_enabled_apps ?? [];
+  useEffect(() => {
+    if (!token) return;
+    if (agentEssayDemo.claimed) return;
+    if (!agentEssayDemo.appId || !agentEssayDemo.adminToken) return;
 
-    return storageEnabledAppIds.includes(appId);
-  }, [appId, dashResponse.data?.flags?.storage_enabled_apps]);
+    jsonMutate(
+      `${config.apiURI}/dash/apps/ephemeral/${agentEssayDemo.appId}/claim`,
+      {
+        token,
+        method: 'POST',
+        body: { token: agentEssayDemo.adminToken },
+      },
+    ).then(() => {
+      setAgentEssayDemo({ ...agentEssayDemo, claimed: true });
+    });
+  }, [token, agentEssayDemo]);
+
+  const apps = (dashResponse.data?.apps ?? []).toSorted(createdAtComparator);
+
+  const app = apps?.find((a) => a.id === appId);
 
   // ui
-  const availableTabs: TabBarTab[] = tabs
-    .filter((t) => isTabAvailable(t, app?.user_app_role))
-    .map((t) => {
-      if (t.id === 'docs') {
-        return {
-          id: t.id,
-          label: t.title,
-          link: app ? `/docs?app=${app.id}` : '/docs',
-        };
-      }
-      return { id: t.id, label: t.title };
-    });
-  const showAppOnboarding =
-    !dashResponse.data?.apps?.length && !dashResponse.data?.invites?.length;
+  const showAppOnboarding = !apps.length && !dashResponse.data?.invites?.length;
   const showNav = !showAppOnboarding;
   const showApp = app && connection && screen === 'main';
   const hasInvites = Boolean(dashResponse.data?.invites?.length);
-  const showInvitesOnboarding = hasInvites && !dashResponse.data?.apps?.length;
+  const showInvitesOnboarding = hasInvites && !apps?.length;
 
   useEffect(() => {
-    if (!router.isReady) return;
     if (screen && screen !== 'main') return;
     if (hasInvites) {
       nav({
@@ -337,14 +390,14 @@ function Dashboard() {
     });
 
     setLocal('dash_app_id', defaultAppId);
-  }, [router.isReady, dashResponse.data]);
+  }, [dashResponse.data]);
 
   useEffect(() => {
     if (!app) return;
     if (typeof window === 'undefined') return;
 
     const db = init({
-      appId,
+      appId: app.id,
       apiURI: config.apiURI,
       websocketURI: config.websocketURI,
       // @ts-expect-error
@@ -355,14 +408,20 @@ function Dashboard() {
     return () => {
       db._core.shutdown();
     };
-  }, [router.isReady, app?.id, app?.admin_token]);
+  }, [app?.id, app?.admin_token]);
 
-  function nav(q: { s: string; app?: string; t?: string }) {
+  function nav(q: { s: string; app?: string; t?: string }, cb?: () => void) {
     if (q.app) setLocal('dash_app_id', q.app);
 
-    router.push({
-      query: q,
-    });
+    router
+      .push({
+        query: q,
+      })
+      .then(() => {
+        if (cb) {
+          cb();
+        }
+      });
   }
 
   function onCreateApp(r: { name: string }) {
@@ -396,6 +455,9 @@ function Dashboard() {
   }
 
   async function onDeleteApp(app: InstantApp) {
+    successToast(
+      `${app.title} is marked for deletion. We will remove all data in 24 hours. Ping us on Discord if you did not mean to do this.`,
+    );
     const _apps = apps.filter((a) => a.id !== app.id);
     dashResponse.mutate((data) =>
       produce(data, (d) => {
@@ -411,19 +473,73 @@ function Dashboard() {
     return (
       <div className="flex h-full w-full flex-col overflow-hidden md:flex-row">
         <Head>
-          <title>Instant - {tabIndex.get(tab)?.title}</title>
-          <meta name="description" content="Welcome to Instant." />
+          <title>Instant - Personal Access Tokens</title>
         </Head>
         <StyledToastContainer />
-        <PersonalAccessTokensScreen />
+        <PersonalAccessTokensScreen className="mx-auto" />
       </div>
     );
   }
+  if (screen === 'user-settings') {
+    return (
+      <div className="flex h-full w-full flex-col overflow-hidden md:flex-row">
+        <Head>
+          <title>Instant - User Settings</title>
+        </Head>
+        <StyledToastContainer />
+        <Nav
+          hasInvites={false}
+          tab={tab as UserSettingsTabId}
+          availableTabs={userTabs.map((t) => ({
+            id: t.id,
+            label: t.title,
+          }))}
+          appId={appId}
+          nav={(params) => nav({ s: 'user-settings', app: appId, ...params })}
+          screen={screen}
+          title={'User Settings'}
+        />
+        <div className="flex flex-1 flex-col overflow-hidden">
+          <div className="flex w-full flex-1 flex-col overflow-hidden">
+            <div className="flex flex-1 flex-col overflow-hidden">
+              <div className="flex flex-col flex-1 overflow-y-scroll">
+                {tab === 'pat' ? (
+                  <PersonalAccessTokensScreen />
+                ) : tab === 'oauth-apps' ? (
+                  <AuthorizedOAuthAppsScreen />
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const availableTabs: TabItem[] = mainTabs
+    .filter((t) => isTabAvailable(t, app?.user_app_role))
+    .map((t) => {
+      if (t.id === 'docs') {
+        return {
+          id: t.id,
+          label: t.title,
+          link: {
+            href: app ? `/docs?app=${app.id}` : '/docs',
+            target: '_blank',
+          },
+        };
+      }
+      return {
+        id: t.id,
+        label: t.title,
+        link: { href: `/dash?s=main&app=${appId}&t=${t.id}` },
+      };
+    });
+
   return (
     <div className="flex h-full w-full flex-col overflow-hidden md:flex-row">
       <Head>
-        <title>Instant - {tabIndex.get(tab)?.title}</title>
-        <meta name="description" content="Welcome to Instant." />
+        <title>Instant - {mainTabIndex.get(tab as MainTabId)?.title}</title>
       </Head>
       <StyledToastContainer />
       {showNav ? (
@@ -431,23 +547,24 @@ function Dashboard() {
           apps={apps}
           hasInvites={Boolean(dashResponse.data?.invites?.length)}
           appId={appId}
-          tab={tab}
+          tab={tab as MainTabId}
           availableTabs={availableTabs}
-          nav={nav}
+          nav={(params) => nav({ s: 'main', app: appId, ...params })}
+          screen={screen}
         />
       ) : null}
       <div className="flex flex-1 flex-col overflow-hidden">
         {screen === 'new' ? (
           <CreateApp onDone={onCreateApp} />
         ) : dashResponse.isLoading ? (
-          <Loading />
+          <FullscreenLoading />
         ) : dashResponse.error ? (
-          <ErrorMessage message={errMessage(dashResponse.error)} />
+          <FullscreenErrorMessage message={errMessage(dashResponse.error)} />
         ) : showAppOnboarding ? (
           <Onboarding
             onCreate={async (p) => {
               await dashResponse.mutate();
-              nav({ s: 'main', app: p.id, t: defaultTab });
+              nav({ s: 'main', app: p.id, t: defaultTab('main') });
             }}
           />
         ) : screen === 'invites' || showInvitesOnboarding ? (
@@ -485,6 +602,8 @@ function Dashboard() {
                   <Home />
                 ) : tab === 'explorer' ? (
                   <ExplorerTab appId={appId} db={connection.db} />
+                ) : tab === 'schema' ? (
+                  <Schema db={connection.db} />
                 ) : tab === 'repl' ? (
                   <QueryInspector
                     className="flex-1 w-full"
@@ -492,9 +611,13 @@ function Dashboard() {
                     db={connection.db}
                   />
                 ) : tab === 'sandbox' ? (
-                  <Sandbox key={appId} app={app} />
+                  <Sandbox key={appId} app={app} db={connection.db} />
                 ) : tab === 'perms' ? (
-                  <Perms app={app} dashResponse={dashResponse} />
+                  <Perms
+                    app={app}
+                    dashResponse={dashResponse}
+                    db={connection.db}
+                  />
                 ) : tab === 'auth' ? (
                   <AppAuth
                     app={app}
@@ -502,23 +625,18 @@ function Dashboard() {
                     dashResponse={dashResponse}
                     nav={nav}
                   />
-                ) : tab === 'storage' ? (
-                  <StorageTab
-                    key={app.id}
-                    app={app}
-                    isEnabled={isStorageEnabled}
-                  />
-                ) : tab == 'admin' && isMinRole('admin', app.user_app_role) ? (
+                ) : tab === 'admin' && isMinRole('admin', app.user_app_role) ? (
                   <Admin
                     dashResponse={dashResponse}
                     app={app}
                     onDelete={() => onDeleteApp(app)}
                     nav={nav}
-                    db={connection.db}
                   />
-                ) : tab == 'billing' &&
+                ) : tab === 'billing' &&
                   isMinRole('collaborator', app.user_app_role) ? (
                   <Billing appId={appId} />
+                ) : tab === 'oauth-apps' ? (
+                  <OAuthApps appId={appId} />
                 ) : null}
               </div>
             </div>
@@ -696,22 +814,16 @@ function Home() {
     <TabContent className="text-sm md:text-base">
       <SectionHeading>Getting Started</SectionHeading>
       <Content>
-        Ready to hack? To get a real-time app in minutes, see our quick example.
-        You can also book some time with the founders to get personalized help
-        (free)
+        Welcome to Instant! Here are some resources to help you get started.
       </Content>
       <div className="grid grid-cols-2 gap-4">
-        <HomeButton href="/docs" title="Quick start">
-          Get running in less than 5 minutes!
-        </HomeButton>
         <HomeButton href="/tutorial" title="Try the Demo">
-          See the magic of Instant in your browser.
+          Follow our tutorial to build a full-stack app with Instant in less
+          than 10 minutes.
         </HomeButton>
-        <HomeButton
-          href="https://calendly.com/instantdb/talk-with-instant-founders"
-          title="Q&A with founders"
-        >
-          Have some questions? Get personalized help from the founders (free)
+        <HomeButton href="/docs" title="Read the Docs">
+          After the tutorial, jump into our docs to start learning how to use
+          Instant.
         </HomeButton>
         <HomeButton
           href="https://discord.com/invite/VU53p7uQcE"
@@ -719,124 +831,6 @@ function Home() {
         >
           Join our Discord to meet like-minded hackers, and to give us feedback
           too!
-        </HomeButton>
-      </div>
-      <SectionHeading>Manage your Data</SectionHeading>
-      <Content>
-        Use the explorer to see your data live. You can also use this to manage
-        your schema. To learn more, check out our docs on how to read, write,
-        and model data.
-      </Content>
-      <div className="grid grid-cols-2 gap-4">
-        <HomeButton href="/docs/instaml" title="Writing data">
-          Our write API is very small! Read up on how to write data to your
-          Instant apps.
-        </HomeButton>
-        <HomeButton href="/docs/instaql" title="Reading data">
-          Once you have some data, learn all the different ways you can read it!
-        </HomeButton>
-        <HomeButton href="/docs/modeling-data" title="Modeling data">
-          Learn how to define advanced relationships and leverage Instant's
-          graph capabilities.
-        </HomeButton>
-        <HomeButton href="/dash?t=explorer" title="Explorer">
-          See your live data and edit your schema.
-        </HomeButton>
-      </div>
-      <SectionHeading>Add Authentication</SectionHeading>
-      <Content>
-        Instant comes with an authentication system. You can use magic codes,
-        Google OAuth, or integrate your own custom flow. We have examples and
-        docs to help you get started.
-      </Content>
-      <div className="grid grid-cols-2 gap-4">
-        <HomeButton href="/docs/auth#magic-codes" title="Magic codes">
-          Passwords are pas·sé, Instant supports magic-code auth out of the box.
-          Read the docs to learn how to add auth into your app in just a few
-          lines of code!
-        </HomeButton>
-        <HomeButton href="/dash?t=auth" title="Manage OAuth">
-          Use the Auth tab to configure Google OAuth. More auth providers to
-          come!
-        </HomeButton>
-        <HomeButton href="/docs/backend#custom-auth" title="Custom auth">
-          Learn how to use the Admin SDK to integrate your auth with Instant.
-        </HomeButton>
-      </div>
-      <SectionHeading>Ephemeral Collaboration</SectionHeading>
-      <Content>
-        <p>
-          When you use Instant to read and write data, you get optimistic
-          updates, offline support, and real-time collaboration out of the box.
-          Every change you make is instantly synced to all connected clients.
-          This makes it easy to build collaborative apps like Figma, Notion, or
-          Linear.
-        </p>
-        <p>
-          Sometimes you want collaboration to be ephemeral. For example, sharing
-          cursors on a shared document, showing who is online, or showing who is
-          typing. We've got some examples to get you started and docs to help
-          you build your own experiences.
-        </p>
-      </Content>
-      <div className="grid grid-cols-2 gap-4">
-        <HomeButton href="/examples" title="Examples">
-          Real examples you can copy/paste into your own apps.
-        </HomeButton>
-        <HomeButton
-          href="/docs/presence-and-topics"
-          title="Presence, Cursors, and Activity"
-        >
-          Learn how to use Instant's presence system to build your own ephemeral
-          collaborative features.
-        </HomeButton>
-      </div>
-      <SectionHeading>Secure your app</SectionHeading>
-      <Content>
-        Ready to ship your app to the world? You'll likely want to add some
-        permissions to ensure only the right people see the right data.
-      </Content>
-      <div className="grid grid-cols-2 gap-4">
-        <HomeButton href="/docs/permissions" title="How to use permissions">
-          Instant uses CEL under the hood for writing permission rules. It's an
-          alternative to row-based security!
-        </HomeButton>
-        <HomeButton href="/dash?t=perms" title="Manage permissions">
-          Write permission rules to secure your app
-        </HomeButton>
-      </div>
-      <SectionHeading>Manage your app</SectionHeading>
-      <Content>
-        Want to see your usage, change your billing, or delete your app? You can
-        do that using the admin and billing tabs.
-      </Content>
-      <div className="grid grid-cols-2 gap-4">
-        <HomeButton href="/dash?t=admin" title="Admin">
-          App management and admin secrets for using Instant on the backend.
-        </HomeButton>
-        <HomeButton href="/dash?t=billing" title="Billing">
-          See your current app usage and manage your subscription.
-        </HomeButton>
-      </div>
-      <SectionHeading>Example Applications</SectionHeading>
-      <Content>
-        We've built a few example applications to help you get started. You can
-        reference these to help you build your own apps.
-      </Content>
-      <div className="grid grid-cols-2 gap-4">
-        <HomeButton
-          href="https://github.com/jsventures/instldraw"
-          title="instldraw (Web)"
-        >
-          tldraw + Instant. See how to model teams, use cursors and leverage
-          permissions.
-        </HomeButton>
-        <HomeButton
-          href="https://github.com/jsventures/stroopwafel"
-          title="Stroopwafel (React Native)"
-        >
-          Multiplayer iOS game built with Expo + Instant. See how you can use
-          Instant to build real-time games.
         </HomeButton>
       </div>
     </TabContent>
@@ -853,6 +847,83 @@ function ExplorerTab({ db, appId }: { db: InstantReactClient; appId: string }) {
   );
 }
 
+function AppCombobox({
+  apps,
+  appId,
+  nav,
+  tab,
+}: {
+  apps: InstantApp[];
+  nav: (p: { s: string; t?: string; app?: string }, cb?: () => void) => void;
+  appId: string;
+  tab: MainTabId;
+}) {
+  const currentApp = apps.find((a) => a.id === appId) || null;
+
+  const [appQuery, setAppQuery] = useState('');
+  const comboboxInputRef = useRef<HTMLInputElement | null>(null);
+
+  const filteredApps = appQuery
+    ? apps.filter((a) => a.title.toLowerCase().includes(appQuery))
+    : apps;
+
+  return (
+    <Combobox
+      immediate={true}
+      value={currentApp}
+      onChange={(app: InstantApp | null) => {
+        if (!app) {
+          return;
+        }
+        setAppQuery('');
+        nav(
+          { s: 'main', app: app.id, t: tab },
+          () => comboboxInputRef.current && comboboxInputRef.current.blur(),
+        );
+      }}
+      onClose={() => setAppQuery('')}
+    >
+      <div className="relative">
+        <ComboboxInput
+          ref={comboboxInputRef}
+          className={clsx(
+            'w-0 basis-[35%] md:w-full md:basis-full truncate text-sm rounded-sm border-gray-300 py-1',
+            'pr-8 pl-3 text-sm/6',
+            'focus:outline-none data-[focus]:outline-2 data-[focus]:-outline-offset-2 data-[focus]:outline-white/25',
+          )}
+          displayValue={(app: InstantApp | null) => (app ? app.title : '')}
+          onChange={(e) => setAppQuery(e.target.value)}
+        />
+        <ComboboxButton className="group absolute inset-y-0 right-0 px-2.5">
+          <ChevronDownIcon
+            height={'1em'}
+            className="fill-gray/300 group-data-[hover]:fill-gray"
+          />
+        </ComboboxButton>
+      </div>
+      <ComboboxOptions
+        anchor="bottom"
+        transition
+        className={clsx(
+          'min-w-[var(--input-width)] bg-white shadow-lg border border-gray-300 divide-y empty:invisible z-50',
+          'border p-1 mx-2 my-1 [--anchor-gap:var(--spacing-1)] ',
+          'transition duration-100 ease-in data-[leave]:data-[closed]:opacity-0',
+        )}
+      >
+        {filteredApps.map((app) => (
+          <ComboboxOption
+            key={app.id}
+            value={app}
+            className="group cursor-pointer px-3 py-1 data-[focus]:bg-blue-100"
+          >
+            <div className="">{app.title}</div>
+          </ComboboxOption>
+        ))}
+      </ComboboxOptions>
+    </Combobox>
+  );
+}
+
 function Nav({
   apps,
   hasInvites,
@@ -860,64 +931,88 @@ function Nav({
   appId,
   tab,
   availableTabs,
+  title,
+  screen,
 }: {
-  apps: InstantApp[];
+  apps?: InstantApp[];
   hasInvites: boolean;
-  nav: (p: { s: string; t?: string; app?: string }) => void;
+  nav: (p: { s?: string; t?: string; app?: string }, cb?: () => void) => void;
   appId: string;
-  tab: TabId;
-  availableTabs: TabBarTab[];
+  tab: MainTabId | UserSettingsTabId;
+  availableTabs: TabItem[];
+  title?: string;
+  screen: string;
 }) {
   const router = useRouter();
-  const currentApp = apps.find((a) => a.id === appId);
+  const showAppNav = apps;
   return (
     <div className="flex flex-col gap-2 border-b border-gray-300 md:w-40 md:gap-0 md:border-b-0 md:border-r bg-gray-50">
-      <div className="flex flex-row justify-between gap-2 p-2 md:flex-col md:justify-start bg-gray-50">
-        <Select
-          className="w-0 basis-[35%] md:w-full md:basis-full truncate text-sm"
-          options={apps.map((a) => ({ label: a.title, value: a.id }))}
-          disabled={apps.length === 0}
-          value={appId}
-          onChange={(app) => {
-            if (!app) {
-              return;
-            }
-
-            nav({ s: 'main', app: app.value, t: tab });
-          }}
-        />
-        <div className="flex md:flex-col gap-2">
-          <Button
-            size="mini"
-            variant="secondary"
-            onClick={() => nav({ s: 'new', app: appId })}
-          >
-            <PlusIcon height={14} /> New app
-          </Button>
-          {hasInvites ? (
-            <Button size="mini" onClick={() => nav({ s: 'invites' })}>
-              Invites
-            </Button>
-          ) : null}
+      {title ? (
+        <div className="flex flex-row justify-between gap-2 p-2 md:flex-col md:justify-start bg-gray-50">
+          <h2>{title}</h2>
         </div>
-      </div>
+      ) : null}
+      {showAppNav ? (
+        <div className="flex flex-row justify-between gap-2 p-2 md:flex-col md:justify-start bg-gray-50">
+          <AppCombobox
+            apps={apps}
+            appId={appId}
+            nav={nav}
+            tab={tab as MainTabId}
+          />
+
+          <div className="flex md:flex-col gap-2">
+            <Button
+              size="mini"
+              variant="secondary"
+              onClick={() => nav({ s: 'new', app: appId })}
+            >
+              <PlusIcon height={14} /> New app
+            </Button>
+            {hasInvites ? (
+              <Button size="mini" onClick={() => nav({ s: 'invites' })}>
+                Invites
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
       <div className="hidden md:visible md:static flex-row overflow-auto md:flex md:flex-col bg-gray-50 h-full">
         <ToggleCollection
           className="gap-0 text-sm"
           buttonClassName="rounded-none py-2"
-          onChange={(t) => nav({ s: 'main', app: appId, t: t.id })}
+          onChange={(t) => nav({ t: t.id })}
           selectedId={tab}
           items={availableTabs.map((t) => ({
             ...t,
             label: (
-              <div className="flex gap-2">
+              <div className="flex gap-2 items-center">
                 <span>{t.label}</span>
+                {t.id === 'docs' && (
+                  <ArrowTopRightOnSquareIcon className="h-4 w-4" />
+                )}
               </div>
             ),
           }))}
         />
       </div>
-      <div className="p-2 border-t bg-gray-50">
+      <div className="p-2 border-t bg-gray-50 flex flex-row items-center justify-center gap-2">
+        <Button
+          size="nano"
+          variant="subtle"
+          className="bg-transparent"
+          onClick={() => {
+            screen === 'user-settings'
+              ? nav({ s: 'main', app: appId })
+              : nav({ s: 'user-settings', t: 'oauth-apps', app: appId });
+          }}
+        >
+          {screen === 'user-settings' ? (
+            <ArrowLeftIcon height={18} />
+          ) : (
+            <Cog6ToothIcon height={18} />
+          )}
+        </Button>
         <Button
           className="w-full"
           size="mini"
@@ -1031,17 +1126,17 @@ function Admin({
   app,
   onDelete,
   nav,
-  db,
 }: {
   dashResponse: APIResponse<DashResponse>;
   app: InstantApp;
   onDelete: () => void;
   nav: (p: { s: string; t?: string; app?: string }) => void;
-  db: InstantReactWebDatabase<any>;
 }) {
   const token = useContext(TokenContext);
   const [deleteAppOk, updateDeleteAppOk] = useState(false);
+  const [isDeletingApp, setIsDeletingApp] = useState(false);
   const [clearAppOk, updateClearAppOk] = useState(false);
+  const [isClearingApp, setIsClearingApp] = useState(false);
   const [editMember, setEditMember] = useState<InstantMember | null>();
   const [hideAdminToken, setHideAdminToken] = useState(true);
   const clearDialog = useDialog();
@@ -1356,9 +1451,10 @@ function Admin({
                 label="I understand and want to clear this app."
               />
               <Button
-                disabled={!clearAppOk}
+                disabled={!clearAppOk || isClearingApp}
                 variant="destructive"
                 onClick={async () => {
+                  setIsClearingApp(true);
                   await jsonFetch(
                     `${config.apiURI}/dash/apps/${app.id}/clear`,
                     {
@@ -1370,12 +1466,13 @@ function Admin({
                     },
                   );
 
+                  setIsClearingApp(false);
                   clearDialog.onClose();
                   dashResponse.mutate();
                   successToast('App cleared!');
                 }}
               >
-                Clear data
+                {isClearingApp ? 'Clearing data...' : 'Clear data'}
               </Button>
             </div>
           </Dialog>
@@ -1393,9 +1490,10 @@ function Admin({
                 label="I understand and want to delete this app."
               />
               <Button
-                disabled={!deleteAppOk}
+                disabled={!deleteAppOk || isDeletingApp}
                 variant="destructive"
                 onClick={async () => {
+                  setIsDeletingApp(true);
                   await jsonFetch(`${config.apiURI}/dash/apps/${app.id}`, {
                     method: 'DELETE',
                     headers: {
@@ -1403,7 +1501,7 @@ function Admin({
                       'content-type': 'application/json',
                     },
                   });
-
+                  setIsDeletingApp(false);
                   onDelete();
                 }}
               >
@@ -1444,13 +1542,7 @@ function CreateApp({ onDone }: { onDone: (o: { name: string }) => void }) {
   );
 }
 
-function Loading() {
-  return (
-    <div className="animate-slow-pulse flex w-full flex-1 flex-col bg-gray-300"></div>
-  );
-}
-
-function ErrorMessage({ message }: { message: string }) {
+function FullscreenErrorMessage({ message }: { message: string }) {
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 p-2">
       <div className="rounded bg-red-100 p-4 text-red-700">{message}</div>
@@ -1487,17 +1579,6 @@ function regenerateAdminToken(
     },
     body: JSON.stringify({ 'admin-token': adminToken }),
   });
-}
-
-function caComp(a: { created_at: string }, b: { created_at: string }) {
-  if (a.created_at < b.created_at) {
-    return 1;
-  }
-
-  if (a.created_at > b.created_at) {
-    return -1;
-  }
-  return 0;
 }
 
 /**

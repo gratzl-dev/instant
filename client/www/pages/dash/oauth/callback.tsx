@@ -3,9 +3,10 @@ import { NextRouter, useRouter } from 'next/router';
 import Head from 'next/head';
 import { useEffect, useState } from 'react';
 import { Button, Content, ScreenHeading } from '@/components/ui';
-import { exchangeOAuthCodeForToken, messageFromInstantError } from '@/lib/auth';
+import { exchangeOAuthCodeForToken } from '@/lib/auth';
+import { messageFromInstantError } from '@/lib/errors';
 import config, { cliOauthParamName } from '@/lib/config';
-import { InstantError } from '@/lib/types';
+import { InstantIssue } from '@/lib/types';
 
 type CallbackState =
   | { type: 'router-loading' }
@@ -126,7 +127,7 @@ export default function OAuthCallback() {
             router.push(finalPath);
           })
           .catch((res) => {
-            const error = messageFromInstantError(res as InstantError);
+            const error = messageFromInstantError(res as InstantIssue);
 
             setState({
               type: 'error',
@@ -156,7 +157,6 @@ export default function OAuthCallback() {
     <div className="flex h-screen w-full flex-col overflow-hidden md:flex-row">
       <Head>
         <title>Instant - Log in with Google</title>
-        <meta name="description" content="Welcome to Instant." />
       </Head>
       <CallbackScreen state={state} />
       <StyledToastContainer />

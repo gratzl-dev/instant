@@ -1,4 +1,4 @@
-import Reactor from "./Reactor";
+import Reactor from './Reactor.js';
 import {
   tx,
   txInit,
@@ -6,22 +6,27 @@ import {
   getOps,
   type TxChunk,
   type TransactionChunk,
-} from "./instatx";
-import weakHash from "./utils/weakHash";
-import id from "./utils/uuid";
-import IndexedDBStorage from "./IndexedDBStorage";
-import WindowNetworkListener from "./WindowNetworkListener";
-import { i } from "./schema";
-import { createDevtool } from "./devtool";
-import version from "./version";
+} from './instatx.js';
+import weakHash from './utils/weakHash.js';
+import id from './utils/uuid.js';
+import IndexedDBStorage from './IndexedDBStorage.js';
+import WindowNetworkListener from './WindowNetworkListener.js';
+import { i } from './schema.js';
+import { createDevtool } from './devtool.js';
+import version from './version.js';
 
 import type {
   PresenceOpts,
   PresenceResponse,
   PresenceSlice,
   RoomSchemaShape,
-} from "./presence";
-import type { IDatabase, IInstantDatabase } from "./coreTypes";
+} from './presence.ts';
+import type {
+  DevtoolConfig,
+  IDatabase,
+  IInstantDatabase,
+  StrictDevtoolConfig,
+} from './coreTypes.ts';
 import type {
   Query,
   QueryResponse,
@@ -30,18 +35,32 @@ import type {
   Exactly,
   InstantObject,
   InstaQLParams,
+  InstaQLOptions,
   InstaQLQueryParams,
   InstaQLEntity,
   InstaQLResult,
-} from "./queryTypes";
-import type { AuthState, User, AuthResult, ConnectionStatus } from "./clientTypes";
+  InstaQLFields,
+} from './queryTypes.ts';
+import type {
+  AuthState,
+  User,
+  AuthResult,
+  ConnectionStatus,
+} from './clientTypes.ts';
 import type {
   InstantQuery,
   InstantQueryResult,
   InstantSchema,
   InstantEntity,
   InstantSchemaDatabase,
-} from "./helperTypes";
+} from './helperTypes.ts';
+import type {
+  InstantDBAttr,
+  InstantDBAttrOnDelete,
+  InstantDBCheckedDataType,
+  InstantDBIdent,
+  InstantDBInferredType,
+} from './attrTypes.ts';
 import type {
   AttrsDefs,
   CardinalityKind,
@@ -64,7 +83,21 @@ import type {
   BackwardsCompatibleSchema,
   UpdateParams,
   LinkParams,
-} from "./schemaTypes";
+  RuleParams,
+} from './schemaTypes.ts';
+import type { InstantRules } from './rulesTypes.ts';
+import type { UploadFileResponse, DeleteFileResponse } from './StorageAPI.ts';
+
+import type {
+  ExchangeCodeForTokenParams,
+  SendMagicCodeParams,
+  SendMagicCodeResponse,
+  SignInWithIdTokenParams,
+  VerifyMagicCodeParams,
+  VerifyResponse,
+} from './authAPI.ts';
+
+import { InstantAPIError, type InstantIssue } from './utils/fetch.js';
 
 const defaultOpenDevtool = true;
 
@@ -74,15 +107,19 @@ export type Config = {
   appId: string;
   websocketURI?: string;
   apiURI?: string;
-  devtool?: boolean;
+  devtool?: boolean | DevtoolConfig;
+  verbose?: boolean;
+  queryCacheLimit?: number;
 };
 
 export type InstantConfig<S extends InstantSchemaDef<any, any, any>> = {
   appId: string;
+  schema?: S;
   websocketURI?: string;
   apiURI?: string;
-  devtool?: boolean;
-  schema?: S;
+  devtool?: boolean | DevtoolConfig;
+  verbose?: boolean;
+  queryCacheLimit?: number;
 };
 
 export type ConfigWithSchema<S extends InstantGraph<any, any>> = Config & {
@@ -90,7 +127,7 @@ export type ConfigWithSchema<S extends InstantGraph<any, any>> = Config & {
 };
 
 export type TransactionResult = {
-  status: "synced" | "enqueued";
+  status: 'synced' | 'enqueued';
   clientId: string;
 };
 
@@ -161,17 +198,42 @@ type UnsubscribeFn = () => void;
 // consts
 
 const defaultConfig = {
-  apiURI: "https://api.instantdb.com",
-  websocketURI: "wss://api.instantdb.com/runtime/session",
+  apiURI: 'https://api.instantdb.com',
+  websocketURI: 'wss://api.instantdb.com/runtime/session',
 };
 
 // hmr
+function initSchemaHashStore(): WeakMap<any, string> {
+  globalThis.__instantDbSchemaHashStore =
+    globalThis.__instantDbSchemaHashStore ?? new WeakMap<any, string>();
+  return globalThis.__instantDbSchemaHashStore;
+}
+
 function initGlobalInstantCoreStore(): Record<string, any> {
   globalThis.__instantDbStore = globalThis.__instantDbStore ?? {};
   return globalThis.__instantDbStore;
 }
 
+function reactorKey(config: InstantConfig<any>): string {
+  // @ts-expect-error
+  const adminToken = config.__adminToken;
+  return (
+    config.appId +
+    '_' +
+    (config.websocketURI || 'default_ws_uri') +
+    '_' +
+    (config.apiURI || 'default_api_uri') +
+    '_' +
+    (adminToken || 'client_only')
+  );
+}
+
 const globalInstantCoreStore = initGlobalInstantCoreStore();
+const schemaHashStore = initSchemaHashStore();
+
+type SignoutOpts = {
+  invalidateToken?: boolean;
+};
 
 /**
  * Functions to log users in and out.
@@ -192,9 +254,12 @@ class Auth {
    *  db.auth.sendMagicCode({email: "example@gmail.com"})
    *    .catch((err) => console.error(err.body?.message))
    */
-  sendMagicCode = (params: { email: string }) => {
+  sendMagicCode = (
+    params: SendMagicCodeParams,
+  ): Promise<SendMagicCodeResponse> => {
     return this.db.sendMagicCode(params);
   };
+
   /**
    * Verify a magic code that was sent to the user's email address.
    *
@@ -204,7 +269,9 @@ class Auth {
    *  db.auth.signInWithMagicCode({email: "example@gmail.com", code: "123456"})
    *       .catch((err) => console.error(err.body?.message))
    */
-  signInWithMagicCode = (params: { email: string; code: string }) => {
+  signInWithMagicCode = (
+    params: VerifyMagicCodeParams,
+  ): Promise<VerifyResponse> => {
     return this.db.signInWithMagicCode(params);
   };
 
@@ -219,7 +286,7 @@ class Auth {
    *   //Sign in
    *   db.auth.signInWithToken(token);
    */
-  signInWithToken = (token: AuthToken) => {
+  signInWithToken = (token: AuthToken): Promise<VerifyResponse> => {
     return this.db.signInWithCustomToken(token);
   };
 
@@ -238,7 +305,10 @@ class Auth {
    *   // Put it in a sign in link
    *   <a href={url}>Log in with Google</a>
    */
-  createAuthorizationURL = (params: { clientName: string; redirectURL }) => {
+  createAuthorizationURL = (params: {
+    clientName: string;
+    redirectURL: string;
+  }): string => {
     return this.db.createAuthorizationURL(params);
   };
 
@@ -260,11 +330,9 @@ class Auth {
    *  .catch((err) => console.error(err.body?.message));
    *
    */
-  signInWithIdToken = (params: {
-    idToken: string;
-    clientName: string;
-    nonce?: string | undefined | null;
-  }) => {
+  signInWithIdToken = (
+    params: SignInWithIdTokenParams,
+  ): Promise<VerifyResponse> => {
     return this.db.signInWithIdToken(params);
   };
 
@@ -284,10 +352,7 @@ class Auth {
    *  .catch((err) => console.error(err.body?.message));
    *
    */
-  exchangeOAuthCode = (params: {
-    code: string;
-    codeVerifier: string | undefined | null;
-  }) => {
+  exchangeOAuthCode = (params: ExchangeCodeForTokenParams) => {
     return this.db.exchangeCodeForToken(params);
   };
 
@@ -302,17 +367,22 @@ class Auth {
    *     db.auth.issuerURI()
    *   );
    */
-  issuerURI = () => {
+  issuerURI = (): string => {
     return this.db.issuerURI();
   };
 
   /**
    * Sign out the current user
    */
-  signOut = () => {
-    return this.db.signOut();
+  signOut = (opts: SignoutOpts = { invalidateToken: true }): Promise<void> => {
+    return this.db.signOut(opts);
   };
 }
+
+type FileOpts = {
+  contentType?: string;
+  contentDisposition?: string;
+};
 
 /**
  * Functions to manage file storage.
@@ -326,26 +396,14 @@ class Storage {
    * @see https://instantdb.com/docs/storage
    * @example
    *   const [file] = e.target.files; // result of file input
-   *   const isSuccess = await db.storage.upload('photos/demo.png', file);
+   *   const data = await db.storage.uploadFile('photos/demo.png', file);
    */
-  upload = (pathname: string, file: File) => {
-    return this.db.upload(pathname, file);
-  };
-
-  /**
-   * @deprecated Use `db.storage.upload` instead
-   */
-  put = this.upload;
-
-  /**
-   * Retrieves a download URL for the provided path.
-   *
-   * @see https://instantdb.com/docs/storage
-   * @example
-   *   const url = await db.storage.getDownloadUrl('photos/demo.png');
-   */
-  getDownloadUrl = (pathname: string) => {
-    return this.db.getDownloadUrl(pathname);
+  uploadFile = (
+    path: string,
+    file: File | Blob,
+    opts: FileOpts = {},
+  ): Promise<UploadFileResponse> => {
+    return this.db.uploadFile(path, file, opts);
   };
 
   /**
@@ -357,6 +415,40 @@ class Storage {
    */
   delete = (pathname: string) => {
     return this.db.deleteFile(pathname);
+  };
+
+  // Deprecated Storage API (Jan 2025)
+  // ---------------------------------
+
+  /**
+   * @deprecated. Use `db.storage.uploadFile` instead
+   * remove in the future.
+   */
+  upload = (pathname: string, file: File) => {
+    return this.db.upload(pathname, file);
+  };
+
+  /**
+   * @deprecated Use `db.storage.uploadFile` instead
+   */
+  put = this.upload;
+
+  /**
+   * @deprecated. getDownloadUrl will be removed in the future.
+   * Use `useQuery` instead to query and fetch for valid urls
+   *
+   * db.useQuery({
+   *   $files: {
+   *     $: {
+   *       where: {
+   *         path: "moop.png"
+   *       }
+   *     }
+   *   }
+   * })
+   */
+  getDownloadUrl = (pathname: string) => {
+    return this.db.getDownloadUrl(pathname);
   };
 }
 
@@ -390,19 +482,19 @@ class InstantCoreDatabase<Schema extends InstantSchemaDef<any, any, any>>
    * @example
    *   // Create a new object in the `goals` namespace
    *   const goalId = id();
-   *   db.transact(tx.goals[goalId].update({title: "Get fit"}))
+   *   db.transact(db.tx.goals[goalId].update({title: "Get fit"}))
    *
    *   // Update the title
-   *   db.transact(tx.goals[goalId].update({title: "Get super fit"}))
+   *   db.transact(db.tx.goals[goalId].update({title: "Get super fit"}))
    *
    *   // Delete it
-   *   db.transact(tx.goals[goalId].delete())
+   *   db.transact(db.tx.goals[goalId].delete())
    *
    *   // Or create an association:
    *   todoId = id();
    *   db.transact([
-   *    tx.todos[todoId].update({ title: 'Go on a run' }),
-   *    tx.goals[goalId].link({todos: todoId}),
+   *    db.tx.todos[todoId].update({ title: 'Go on a run' }),
+   *    db.tx.goals[goalId].link({todos: todoId}),
    *  ])
    */
   transact(
@@ -442,8 +534,9 @@ class InstantCoreDatabase<Schema extends InstantSchemaDef<any, any, any>>
   subscribeQuery<Q extends InstaQLParams<Schema>>(
     query: Q,
     cb: (resp: InstaQLSubscriptionState<Schema, Q>) => void,
+    opts?: InstaQLOptions,
   ) {
-    return this._reactor.subscribeQuery(query, cb);
+    return this._reactor.subscribeQuery(query, cb, opts);
   }
 
   /**
@@ -462,6 +555,20 @@ class InstantCoreDatabase<Schema extends InstantSchemaDef<any, any, any>>
    */
   subscribeAuth(cb: (auth: AuthResult) => void): UnsubscribeFn {
     return this._reactor.subscribeAuth(cb);
+  }
+
+  /**
+   * One time query for the logged in state. This is useful
+   * for scenarios where you want to know the current auth
+   * state without subscribing to changes.
+   *
+   * @see https://instantdb.com/docs/auth
+   * @example
+   *   const user = await db.getAuth();
+   *   console.log('logged in as', user.email)
+   */
+  getAuth(): Promise<User | null> {
+    return this._reactor.getAuth();
   }
 
   /**
@@ -485,7 +592,9 @@ class InstantCoreDatabase<Schema extends InstantSchemaDef<any, any, any>>
    *     console.log('Connection status:', connectionState);
    *   });
    */
-  subscribeConnectionStatus(cb: (status: ConnectionStatus) => void): UnsubscribeFn {
+  subscribeConnectionStatus(
+    cb: (status: ConnectionStatus) => void,
+  ): UnsubscribeFn {
     return this._reactor.subscribeConnectionStatus(cb);
   }
 
@@ -508,10 +617,13 @@ class InstantCoreDatabase<Schema extends InstantSchemaDef<any, any, any>>
    * room.leaveRoom();
    */
   joinRoom<RoomType extends keyof RoomsOf<Schema>>(
-    roomType: RoomType = "_defaultRoomType" as RoomType,
-    roomId: string = "_defaultRoomId",
+    roomType: RoomType = '_defaultRoomType' as RoomType,
+    roomId: string = '_defaultRoomId',
+    opts?: {
+      initialPresence?: Partial<PresenceOf<Schema, RoomType>>;
+    },
   ): RoomHandle<PresenceOf<Schema, RoomType>, TopicsOf<Schema, RoomType>> {
-    const leaveRoom = this._reactor.joinRoom(roomId);
+    const leaveRoom = this._reactor.joinRoom(roomId, opts?.initialPresence);
 
     return {
       leaveRoom,
@@ -528,7 +640,7 @@ class InstantCoreDatabase<Schema extends InstantSchemaDef<any, any, any>>
   }
 
   shutdown() {
-    delete globalInstantCoreStore[this._reactor.config.appId];
+    delete globalInstantCoreStore[reactorKey(this._reactor.config)];
     this._reactor.shutdown();
   }
 
@@ -547,12 +659,35 @@ class InstantCoreDatabase<Schema extends InstantSchemaDef<any, any, any>>
    */
   queryOnce<Q extends InstaQLParams<Schema>>(
     query: Q,
+    opts?: InstaQLOptions,
   ): Promise<{
     data: InstaQLResponse<Schema, Q>;
     pageInfo: PageInfoResponse<Q>;
   }> {
-    return this._reactor.queryOnce(query);
+    return this._reactor.queryOnce(query, opts);
   }
+}
+
+function schemaHash(schema?: InstantSchemaDef<any, any, any>): string {
+  if (!schema) {
+    return '0';
+  }
+
+  if (schemaHashStore.get(schema)) {
+    return schemaHashStore.get(schema);
+  }
+  const hash = weakHash(schema);
+  schemaHashStore.set(schema, hash);
+  return hash;
+}
+
+function schemaChanged(
+  existingClient: InstantCoreDatabase<any>,
+  newSchema?: InstantSchemaDef<any, any, any>,
+): boolean {
+  return (
+    schemaHash(existingClient._reactor.config.schema) !== schemaHash(newSchema)
+  );
 }
 
 /**
@@ -572,7 +707,7 @@ class InstantCoreDatabase<Schema extends InstantSchemaDef<any, any, any>>
  *  import schema from ""../instant.schema.ts";
  *
  *  const db = init({ appId: "my-app-id", schema })
- *  
+ *
  *  // To learn more: https://instantdb.com/docs/modeling-data
  */
 function init<
@@ -584,10 +719,13 @@ function init<
   versions?: { [key: string]: string },
 ): InstantCoreDatabase<Schema> {
   const existingClient = globalInstantCoreStore[
-    config.appId
+    reactorKey(config)
   ] as InstantCoreDatabase<any>;
 
   if (existingClient) {
+    if (schemaChanged(existingClient, config.schema)) {
+      existingClient._reactor.updateSchema(config.schema);
+    }
     return existingClient;
   }
 
@@ -599,46 +737,47 @@ function init<
     },
     Storage || IndexedDBStorage,
     NetworkListener || WindowNetworkListener,
-    { ...(versions || {}), "@instantdb/core": version },
+    { ...(versions || {}), '@instantdb/core': version },
   );
 
   const client = new InstantCoreDatabase<any>(reactor);
-  globalInstantCoreStore[config.appId] = client;
+  globalInstantCoreStore[reactorKey(config)] = client;
 
-  if (typeof window !== "undefined" && typeof window.location !== "undefined") {
-    const showDevtool =
-      // show widget by default?
-      ("devtool" in config ? Boolean(config.devtool) : defaultOpenDevtool) &&
-      // only run on localhost (dev env)
-      window.location.hostname === "localhost" &&
-      // used by dash and other internal consumers
-      !Boolean((globalThis as any)._nodevtool);
-
-    if (showDevtool) {
-      createDevtool(config.appId);
-    }
-  }
+  handleDevtool(config.appId, config.devtool);
 
   return client;
 }
 
-type InstantRules = {
-  [EntityName: string]: {
-    allow: {
-      view?: string;
-      create?: string;
-      update?: string;
-      delete?: string;
-      $default?: string;
-    };
-    bind?: string[];
+function handleDevtool(appId: string, devtool: boolean | DevtoolConfig) {
+  if (
+    typeof window === 'undefined' ||
+    typeof window.location === 'undefined' ||
+    typeof document === 'undefined'
+  ) {
+    return;
+  }
+
+  if (typeof devtool === 'boolean' && !devtool) {
+    return;
+  }
+
+  const config: StrictDevtoolConfig = {
+    position: 'bottom-right' as const,
+    allowedHosts: ['localhost'],
+    ...(typeof devtool === 'object' ? devtool : {}),
   };
-};
+
+  if (!config.allowedHosts.includes(window.location.hostname)) {
+    return;
+  }
+
+  createDevtool(appId, config);
+}
 
 /**
  * @deprecated
  * `init_experimental` is deprecated. You can replace it with `init`.
- * 
+ *
  * @example
  *
  * // Before
@@ -659,6 +798,9 @@ export {
   tx,
   txInit,
   lookup,
+
+  // error
+  InstantAPIError,
 
   // cli
   i,
@@ -701,12 +843,14 @@ export {
 
   // new query types
   type InstaQLParams,
+  type InstaQLOptions,
   type InstaQLQueryParams,
   type InstantQuery,
   type InstantQueryResult,
   type InstantSchema,
   type InstantEntity,
   type InstantSchemaDatabase,
+  type InstaQLFields,
 
   // schema types
   type AttrsDefs,
@@ -734,4 +878,28 @@ export {
   type InstantRules,
   type UpdateParams,
   type LinkParams,
+  type RuleParams,
+
+  // attr types
+  type InstantDBAttr,
+  type InstantDBAttrOnDelete,
+  type InstantDBCheckedDataType,
+  type InstantDBIdent,
+  type InstantDBInferredType,
+
+  // auth types
+  type ExchangeCodeForTokenParams,
+  type SendMagicCodeParams,
+  type SendMagicCodeResponse,
+  type SignInWithIdTokenParams,
+  type VerifyMagicCodeParams,
+  type VerifyResponse,
+
+  // storage types
+  type FileOpts,
+  type UploadFileResponse,
+  type DeleteFileResponse,
+
+  // error types
+  type InstantIssue,
 };

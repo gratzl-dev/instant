@@ -4,7 +4,8 @@
             [instant.util.crypt :as crypt-util])
   (:import
    (java.time Instant)
-   (java.time.temporal ChronoUnit)))
+   (java.time.temporal ChronoUnit)
+   (java.util Date)))
 
 (def etype "$oauthRedirects")
 
@@ -14,7 +15,7 @@
       (crypt-util/bytes->hex-string)))
 
 (defn create!
-  ([params] (create! (aurora/conn-pool) params))
+  ([params] (create! (aurora/conn-pool :write) params))
   ([conn {:keys [app-id state cookie redirect-url oauth-client-id
                  code-challenge-method code-challenge]}]
    (update-op
@@ -34,7 +35,7 @@
 
 (defn consume!
   "Gets and deletes the oauth-redirect so that it can be used only once."
-  ([params] (consume! (aurora/conn-pool) params))
+  ([params] (consume! (aurora/conn-pool :write) params))
   ([conn {:keys [state app-id]}]
    (update-op
     conn
@@ -55,4 +56,4 @@
 (defn expired?
   ([oauth-redirect] (expired? (Instant/now) oauth-redirect))
   ([now {created-at :created_at}]
-   (> (.between ChronoUnit/MINUTES (.toInstant created-at) now) 10)))
+   (> (.between ChronoUnit/MINUTES (Date/.toInstant created-at) now) 10)))

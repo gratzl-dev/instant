@@ -1,6 +1,8 @@
 (ns instant.system-catalog
   (:require [clojure.set :refer [map-invert]]
-            [clojure.string :as string]))
+            [clojure.string :as string])
+  (:import
+   [java.util UUID]))
 
 ;; ---------
 ;; Constants
@@ -35,11 +37,15 @@
    "$oauthUserLinks" "ol"
    "$oauthClients" "oc"
    "$oauthCodes" "co"
-   "$oauthRedirects" "or"})
+   "$oauthRedirects" "or"
+   "$files" "fi"})
 
 (def all-etypes (set (keys etype-shortcodes)))
 
 (def shortcodes-etype (map-invert etype-shortcodes))
+
+(defn reserved? [etype]
+  (string/starts-with? etype "$"))
 
 (def label-shortcodes
   {"id" "id"
@@ -60,7 +66,14 @@
    "stateHash" "statehash"
    "cookieHash" "cookihash"
    "redirectUrl" "redireurl"
-   "$oauthClient" "oauclient"})
+   "$oauthClient" "oauclient"
+   "path" "path"
+   "url" "url"
+   "size" "size"
+   "content-type" "c-type"
+   "content-disposition" "cdisp"
+   "location-id" "lid"
+   "key-version" "kv"})
 
 (def shortcodes-label (map-invert label-shortcodes))
 
@@ -103,7 +116,7 @@
                      (bitstring->char bitstring)))))
          (apply str))))
 
-(defn decode-system-uuid [uuid]
+(defn decode-system-uuid [^UUID uuid]
   (let [system-str (decode-long->string (.getMostSignificantBits uuid))
         [etype-shortcode label-shortcode] (string/split (decode-long->string (.getLeastSignificantBits uuid))
                                                         #"\/")]
@@ -122,12 +135,13 @@
   [(encode-system-uuid :ident etype label) etype label])
 
 (defn make-attr [etype label & props]
-  (merge {:id (get-attr-id etype label)
+  (merge {:id               (get-attr-id etype label)
           :forward-identity (get-ident-spec etype label)
-          :unique? false
-          :index? false
-          :value-type :blob
-          :cardinality :one}
+          :unique?          false
+          :index?           false
+          :required?        false
+          :value-type       :blob
+          :cardinality      :one}
          (apply hash-map props)))
 
 (def $users-attrs
@@ -263,6 +277,41 @@
    (make-attr "$oauthRedirects" "codeChallenge"
               :checked-data-type :string)])
 
+(def $files-attrs
+  [(make-attr "$files" "id"
+              :unique? true
+              :index? true)
+   (make-attr "$files" "path"
+              :unique? true
+              :index? true
+              :checked-data-type :string
+              :required? true)
+   (make-attr "$files" "size"
+              :unique? false
+              :index? true
+              :checked-data-type :number)
+   (make-attr "$files" "content-type"
+              :unique? false
+              :index? true
+              :checked-data-type :string)
+   (make-attr "$files" "content-disposition"
+              :unique? false
+              :index? true
+              :checked-data-type :string)
+   (make-attr "$files" "location-id"
+              :unique? true
+              :index? true
+              :checked-data-type :string
+              :required? true)
+   (make-attr "$files" "key-version"
+              :unique? false
+              :index? false
+              :checked-data-type :number)
+   (make-attr "$files" "url"
+              :unique? false
+              :index? false
+              :checked-data-type :string)])
+
 (def all-attrs (concat $users-attrs
                        $magic-code-attrs
                        $user-refresh-token-attrs
@@ -270,4 +319,5 @@
                        $user-oauth-link-attrs
                        $oauth-client-attrs
                        $oauth-code-attrs
-                       $oauth-redirect-attrs))
+                       $oauth-redirect-attrs
+                       $files-attrs))

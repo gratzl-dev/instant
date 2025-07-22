@@ -5,10 +5,11 @@
             [instant.util.exception :as ex])
   (:import
    (java.time Instant)
-   (java.time.temporal ChronoUnit)))
+   (java.time.temporal ChronoUnit)
+   (java.util Date)))
 
 (defn create!
-  ([params] (create! (aurora/conn-pool) params))
+  ([params] (create! (aurora/conn-pool :write) params))
   ([conn {:keys [ticket secret]}]
    (sql/execute-one!
     conn
@@ -20,7 +21,7 @@
      ticket (crypt-util/uuid->sha256 secret)])))
 
 (defn claim!
-  ([params] (claim! (aurora/conn-pool) params))
+  ([params] (claim! (aurora/conn-pool :write) params))
   ([conn {:keys [ticket user-id]}]
    (sql/execute-one!
     conn
@@ -35,14 +36,14 @@
 (defn expired?
   ([magic-code] (expired? (Instant/now) magic-code))
   ([now {created-at :created_at}]
-   (> (.between ChronoUnit/MINUTES (.toInstant created-at) now) 2)))
+   (> (.between ChronoUnit/MINUTES (Date/.toInstant created-at) now) 2)))
 
 (defn voided?
   [{used? :used user-id :user_id :as _login}]
   (and used? (not user-id)))
 
 (defn use!
-  ([params] (use! (aurora/conn-pool) params))
+  ([params] (use! (aurora/conn-pool :write) params))
   ([conn {:keys [secret]}]
    (let [{user-id :user_id id :id :as login}
          (sql/select-one conn
@@ -82,7 +83,7 @@
      claimed)))
 
 (defn void!
-  ([params] (void! (aurora/conn-pool) params))
+  ([params] (void! (aurora/conn-pool :write) params))
   ([conn {:keys [ticket]}]
    (sql/execute-one!
     conn

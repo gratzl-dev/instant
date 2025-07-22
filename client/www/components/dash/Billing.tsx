@@ -1,13 +1,10 @@
 import { SectionHeading, Button, Content } from '@/components/ui';
-import { messageFromInstantError, friendlyErrorMessage, useAuthedFetch } from '@/lib/auth';
+import { friendlyErrorMessage, useAuthedFetch } from '@/lib/auth';
+import { messageFromInstantError } from '@/lib/errors';
 import config, { stripeKey } from '@/lib/config';
 import { TokenContext } from '@/lib/contexts';
 import { jsonFetch } from '@/lib/fetch';
-import {
-  AppsSubscriptionResponse,
-  InstantError,
-  SubscriptionName,
-} from '@/lib/types';
+import { AppsSubscriptionResponse, InstantIssue } from '@/lib/types';
 import { loadStripe } from '@stripe/stripe-js';
 import { useContext, useRef } from 'react';
 import { Loading, ErrorMessage } from '@/components/dash/shared';
@@ -15,7 +12,6 @@ import { errorToast } from '@/lib/toast';
 import clsx from 'clsx';
 import confetti from 'canvas-confetti';
 
-const stripePromise = loadStripe(stripeKey);
 const GB_1 = 1024 * 1024 * 1024;
 const GB_10 = 10 * GB_1;
 
@@ -40,9 +36,9 @@ async function createCheckoutSession(appId: string, token: string) {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-    }
+    },
   );
-  Promise.all([stripePromise, sessionPromise])
+  Promise.all([loadStripe(stripeKey), sessionPromise])
     .then(([stripe, session]) => {
       if (!stripe || !session) {
         throw new Error('Failed to create checkout session');
@@ -51,7 +47,7 @@ async function createCheckoutSession(appId: string, token: string) {
     })
     .catch((err) => {
       const message =
-        messageFromInstantError(err as InstantError) ||
+        messageFromInstantError(err as InstantIssue) ||
         'Failed to connect w/ Stripe! Try again or ping us on Discord if this persists.';
       const friendlyMessage = friendlyErrorMessage('dash-billing', message);
       errorToast(friendlyMessage);
@@ -68,9 +64,9 @@ async function createPortalSession(appId: string, token: string) {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-    }
+    },
   );
-  Promise.all([stripePromise, sessionPromise])
+  Promise.all([loadStripe(stripeKey), sessionPromise])
     .then(([stripe, session]) => {
       if (!stripe || !session) {
         throw new Error('Failed to create portal session');
@@ -79,7 +75,7 @@ async function createPortalSession(appId: string, token: string) {
     })
     .catch((err) => {
       const message =
-        messageFromInstantError(err as InstantError) ||
+        messageFromInstantError(err as InstantIssue) ||
         'Failed to connect w/ Stripe! Try again or ping us on Discord if this persists.';
       const friendlyMessage = friendlyErrorMessage('dash-billing', message);
       errorToast(friendlyMessage);
@@ -103,21 +99,21 @@ export default function Billing({ appId }: { appId: string }) {
   const confettiRef = useRef<HTMLDivElement>(null);
 
   const onUpgrade = async (
-    e: React.MouseEvent<HTMLButtonElement, MouseEvent>
+    e: React.MouseEvent<HTMLButtonElement, MouseEvent>,
   ) => {
     e.preventDefault();
     createCheckoutSession(appId, token);
   };
 
   const onManage = async (
-    e: React.MouseEvent<HTMLButtonElement, MouseEvent>
+    e: React.MouseEvent<HTMLButtonElement, MouseEvent>,
   ) => {
     e.preventDefault();
     createPortalSession(appId, token);
   };
 
   const authResponse = useAuthedFetch<AppsSubscriptionResponse>(
-    `${config.apiURI}/dash/apps/${appId}/billing`
+    `${config.apiURI}/dash/apps/${appId}/billing`,
   );
 
   if (authResponse.isLoading) {
@@ -198,6 +194,18 @@ export default function Billing({ appId }: { appId: string }) {
           </span>
         </h2>
         <ProgressBar width={progress} />
+        <div className="flex justify-start text-sm pt-3 space-x-2 pl-2">
+          {totalAppBytes > 0 && (
+            <span className="text-sm font-mono text-gray-500">
+              DB ({friendlyUsage(totalAppBytes)})
+            </span>
+          )}
+          {totalStorageBytes > 0 && (
+            <span className="text-sm font-mono text-gray-500">
+              Storage ({friendlyUsage(totalStorageBytes)})
+            </span>
+          )}
+        </div>
       </div>
       {isFreeTier ? (
         <div className="flex flex-col space-y-4">

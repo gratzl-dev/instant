@@ -12,7 +12,7 @@
    (java.util UUID)))
 
 (defn add!
-  ([params] (add! (aurora/conn-pool) params))
+  ([params] (add! (aurora/conn-pool :write) params))
   ([conn {:keys [app-id service params]}]
    (let [id (UUID/randomUUID)]
      (sql/execute-one!
@@ -23,7 +23,7 @@
        id app-id service (with-meta params {:pgtype "text[]"})]))))
 
 (defn delete-by-id!
-  ([params] (delete-by-id! (aurora/conn-pool) params))
+  ([params] (delete-by-id! (aurora/conn-pool :write) params))
   ([conn {:keys [id app-id]}]
    (sql/execute-one!
     conn
@@ -36,7 +36,7 @@
     (ex/assert-record! record :app-authorized-redirect-origin {:args args})))
 
 (defn get-all-for-app
-  ([params] (get-all-for-app (aurora/conn-pool) params))
+  ([params] (get-all-for-app (aurora/conn-pool :read) params))
   ([conn {:keys [app-id]}]
    (sql/select
     conn
@@ -48,8 +48,8 @@
 ;; deploy id format, 1234abcd12acde000111cdef--yoursitename.netlify.app
 ;; live url format, e3757530--yoursitename.netlify.live
 (defn matches-netlify? [host [site-name]]
-  (when (or (.endsWith host "netlify.app")
-            (.endsWith host "netlify.live"))
+  (when (or (string/ends-with? host "netlify.app")
+            (string/ends-with? host "netlify.live"))
     (when-let [[_ matched-site-name] (or (re-matches #"^.+--(.+)\.netlify\.(?:app|live)$" host)
                                          (re-matches #"^(.+)\.netlify\.app$" host))]
       (= site-name matched-site-name))))
@@ -58,8 +58,8 @@
 ;; All vercel urls start with the project-name and end with the deployment suffix
 ;; (usually vercel.app)
 (defn matches-vercel? [host [deployment-suffix project-name]]
-  (and (.endsWith host deployment-suffix)
-       (.startsWith host project-name)))
+  (and (string/ends-with? host deployment-suffix)
+       (string/starts-with? host project-name)))
 
 (defn matches-generic? [host [host-param]]
   (= host host-param))
@@ -106,7 +106,7 @@
                           "Custom scheme should be a string.")
                         (when (contains? reserved-uri-schemes (first params))
                           (str "The scheme `" (first params) "` is not allowed.")))
-    (str "Unrecognized service ")))
+    (str "Unrecognized service " service)))
 
 (comment
   (add! {:app-id (UUID/fromString "3cc5c5c8-07df-42b2-afdc-6a04cbf0c40a")

@@ -11,8 +11,9 @@ import {
 import config, { isDev } from '@/lib/config';
 import googleIconSvg from '../../public/img/google_g.svg';
 import Image from 'next/image';
-import { InstantError } from '@/lib/types';
+import { InstantIssue } from '@/lib/types';
 import { url } from '@/lib/url';
+import { useRouter } from 'next/router';
 
 type State = {
   sentEmail: string | undefined;
@@ -78,6 +79,8 @@ function EmailStep(props: {
   error?: string;
   ticket?: string;
 }) {
+  const router = useRouter();
+
   return (
     <div className="flex flex-col gap-4">
       <form
@@ -119,6 +122,7 @@ function EmailStep(props: {
             href={url(config.apiURI, `/dash/oauth/start`, {
               ticket: props.ticket,
               redirect_to_dev: isDev ? 'true' : undefined,
+              redirect_path: router.asPath,
             })}
           >
             <span className="flex items-center space-x-2">
@@ -181,7 +185,7 @@ export default function Auth(props: {
           isLoading: false,
           error: errorFromVerifyMagicCode(err),
         }));
-      }
+      },
     );
   };
 
@@ -200,7 +204,7 @@ export default function Auth(props: {
     }));
   };
   return (
-    <div className="flex h-screen items-center justify-center p-4">
+    <div className="flex h-full items-center justify-center p-4">
       <div className="max-w-sm">
         <span className="inline-flex items-center space-x-2">
           <LogoIcon />
@@ -240,7 +244,7 @@ export default function Auth(props: {
   );
 }
 
-function errorFromVerifyMagicCode(res: InstantError): string {
+function errorFromVerifyMagicCode(res: InstantIssue): string {
   const errorType = res.body?.type;
   switch (errorType) {
     case 'param-missing':
@@ -256,7 +260,7 @@ function errorFromVerifyMagicCode(res: InstantError): string {
   }
 }
 
-function errorFromSendMagicCode(res: InstantError): string {
+function errorFromSendMagicCode(res: InstantIssue): string {
   const errorType = res.body?.type;
   const defaultMsg =
     'Uh oh, something went wrong sending you a magic code, please ping us!';

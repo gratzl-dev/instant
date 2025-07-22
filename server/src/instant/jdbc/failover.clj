@@ -6,6 +6,7 @@
    [instant.jdbc.aurora :as aurora]
    [instant.jdbc.sql :as sql]
    [instant.util.crypt :refer [bytes->hex-string]]
+   [instant.util.lang :as lang]
    [next.jdbc :as next-jdbc]
    [next.jdbc.result-set :as rs])
   (:import
@@ -13,11 +14,7 @@
 
 (defn start-new-pool [aurora-config]
   (let [conn-pool-size (config/get-connection-pool-size)]
-    (sql/start-pool
-     (assoc aurora-config
-            :maxLifetime (* 10 60 1000)
-            :maximumPoolSize conn-pool-size
-            :targetServerType "primary"))))
+    (aurora/start-pool conn-pool-size aurora-config)))
 
 ;; Keep this here just in case
 (declare previous-conn-pool)
@@ -35,20 +32,23 @@
     ;; Make the connections wait. For a future improvement, we could have the
     ;; caller tell us if they wanted a read-only connection and then we wouldn't
     ;; have to pause reads until after we waited for writes to complete
-    (alter-var-root #'aurora/conn-pool (fn [_] (fn [] @next-pool-promise)))
+    (alter-var-root #'aurora/conn-pool (fn [_] (fn [rw]
+                                                 (if (= :read rw)
+                                                   (aurora/memoized-read-only-wrapper prev-pool)
+                                                   @next-pool-promise))))
     ;; Give transactions half the receive-timeout to complete
     (println "Waiting for 2.5 seconds for transactions to complete")
     (Thread/sleep 2500)
     (println "Canceling in-progress transactions"
              (count @(:stmts sql/default-statement-tracker)))
-    (sql/cancel-in-progress @(:stmts sql/default-statement-tracker))
+    (sql/cancel-in-progress sql/default-statement-tracker)
     ;; Create a transaction we can use as a proxy for everything syncing over to
     ;; the new instance
     (let [tx (transaction-model/create! aurora/-conn-pool
                                         {:app-id (config/instant-config-app-id)})
           quit (fn []
                  (println "Abandoning failover")
-                 (.close next-pool)
+                 (lang/close next-pool)
                  (deliver next-pool-promise prev-pool)
                  (alter-var-root #'aurora/conn-pool (fn [_] conn-pool-fn-before))
                  (throw (Exception. "Abandoning failover, somehow the writes aren't in sync.")))]
@@ -81,7 +81,7 @@
     (println "Reset variables, waiting 30 seconds for any in-progress queries to complete")
     (Thread/sleep 30001)
     (println "Closing the old connection pool.")
-    (.close prev-pool)
+    (lang/close prev-pool)
     (println "NEXT STEPS:")
     (println "  1. Put the old database to sleep so that it doesn't accidentally get written to.")
     (println "  2. Update the config so that old db is now new db and redeploy")))

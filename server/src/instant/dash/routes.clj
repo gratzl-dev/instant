@@ -1,66 +1,79 @@
 (ns instant.dash.routes
   (:require [clj-http.client :as clj-http]
-            [clojure.string :as string]
+            [clojure.core.cache.wrapped :as cache]
             [clojure.set :as set]
+            [clojure.string :as string]
             [clojure.tools.logging :as log]
-            [compojure.core :refer [defroutes GET POST DELETE] :as compojure]
+            [clojure.walk :as w]
+            [compojure.core :as compojure :refer [defroutes DELETE GET POST PUT]]
+            [instant.config :as config]
             [instant.dash.admin :as dash-admin]
-            [instant.model.app :as app-model]
-            [instant.model.app-authorized-redirect-origin :as app-authorized-redirect-origin-model]
-            [instant.model.app-oauth-client :as app-oauth-client-model]
-            [instant.model.app-oauth-service-provider :as app-oauth-service-provider-model]
-            [instant.model.instant-user-magic-code :as  instant-user-magic-code-model]
-            [instant.model.outreach :as outreach-model]
-            [instant.discord :as discord]
-            [instant.model.instant-user-refresh-token :as instant-user-refresh-token-model]
-            [instant.model.instant-user :as instant-user-model]
-            [instant.model.app-member-invites :as instant-app-member-invites-model]
-            [instant.model.app-members :as instant-app-members]
-            [instant.model.instant-oauth-code :as instant-oauth-code-model]
-            [instant.model.instant-oauth-redirect :as instant-oauth-redirect-model]
+            [instant.dash.ephemeral-app :as ephemeral-app]
             [instant.db.indexing-jobs :as indexing-jobs]
             [instant.db.model.attr :as attr-model]
-            [instant.flags :refer [admin-email?] :as flags]
-            [instant.model.rule :as rule-model]
-            [instant.model.instant-profile :as instant-profile-model]
-            [instant.model.instant-subscription :as instant-subscription-model]
-            [instant.model.app-email-template :as app-email-template-model]
-            [instant.model.app-email-sender :as app-email-sender-model]
-            [instant.model.instant-cli-login :as instant-cli-login-model]
-            [instant.postmark :as postmark]
-            [instant.util.async :refer [fut-bg]]
-            [instant.util.crypt :as crypt-util]
-            [instant.util.email :as email]
-            [instant.util.json :as json]
-            [instant.util.tracer :as tracer]
-            [instant.util.uuid :as uuid-util]
-            [instant.util.string :as string-util]
-            [instant.util.number :as number-util]
-            [instant.util.storage :as storage-util]
-            [instant.session-counter :as session-counter]
-            [ring.middleware.cookies :refer [wrap-cookies]]
-            [ring.util.http-response :as response]
-            [instant.model.app-admin-token :as app-admin-token-model]
-            [clojure.walk :as w]
-            [instant.config :as config]
+            [instant.discord :as discord]
             [instant.fixtures :as fixtures]
-            [instant.dash.ephemeral-app :as ephemeral-app]
+            [instant.flags :as flags :refer [admin-email?]]
+            [instant.intern.metrics :as metrics]
+            [instant.jdbc.aurora :as aurora]
+            [instant.lib.ring.websocket :as ws]
+            [instant.machine-summaries :as machine-summaries]
+            [instant.model.app :as app-model]
+            [instant.model.app-admin-token :as app-admin-token-model]
+            [instant.model.app-authorized-redirect-origin :as app-authorized-redirect-origin-model]
+            [instant.model.app-email-sender :as app-email-sender-model]
+            [instant.model.app-email-template :as app-email-template-model]
+            [instant.model.app-file :as app-file-model]
+            [instant.model.app-member-invites :as instant-app-member-invites-model]
+            [instant.model.app-members :as instant-app-members]
+            [instant.model.app-oauth-client :as app-oauth-client-model]
+            [instant.model.app-oauth-service-provider :as app-oauth-service-provider-model]
+            [instant.model.instant-cli-login :as instant-cli-login-model]
+            [instant.model.instant-oauth-code :as instant-oauth-code-model]
+            [instant.model.instant-oauth-redirect :as instant-oauth-redirect-model]
+            [instant.model.instant-personal-access-token :as instant-personal-access-token-model]
+            [instant.model.instant-profile :as instant-profile-model]
             [instant.model.instant-stripe-customer :as instant-stripe-customer-model]
+            [instant.model.instant-subscription :as instant-subscription-model]
+            [instant.model.instant-user :as instant-user-model]
+            [instant.model.instant-user-magic-code :as instant-user-magic-code-model]
+            [instant.model.instant-user-refresh-token :as instant-user-refresh-token-model]
+            [instant.model.oauth-app :as oauth-app-model]
+            [instant.model.outreach :as outreach-model]
+            [instant.model.rule :as rule-model]
+            [instant.model.schema :as schema-model]
+            [instant.postmark :as postmark]
+            [instant.reactive.ephemeral :as eph]
+            [instant.session-counter :as session-counter]
+            [instant.storage.coordinator :as storage-coordinator]
+            [instant.stripe :as stripe]
+            [instant.superadmin.routes :refer [req->superadmin-user-and-app!]]
+            [instant.system-catalog :as system-catalog]
+            [instant.util.async :refer [fut-bg]]
+            [instant.util.coll :as ucoll]
+            [instant.util.crypt :as crypt-util]
             [instant.util.date :as date]
+            [instant.util.email :as email]
             [instant.util.exception :as ex]
             [instant.util.http :as http-util]
+            [instant.util.json :as json]
+            [instant.util.number :as number-util]
+            [instant.util.semver :as semver]
+            [instant.util.string :as string-util]
+            [instant.util.token :as token-util]
+            [instant.util.tracer :as tracer]
+            [instant.util.url :as url-util]
+            [instant.util.uuid :as uuid-util]
+            [medley.core :as medley]
             [next.jdbc :as next-jdbc]
-            [instant.lib.ring.websocket :as ws]
-            [instant.jdbc.aurora :as aurora]
-            [instant.stripe :as stripe]
-            [instant.storage.s3 :as s3-util]
-            [instant.storage.beta :as storage-beta]
-            [instant.model.instant-personal-access-token :as instant-personal-access-token-model]
-            [instant.model.schema :as schema-model])
+            [ring.middleware.cookies :refer [wrap-cookies]]
+            [ring.util.http-response :as response])
   (:import
    (com.stripe.model.checkout Session)
    (io.undertow.websockets.core WebSocketChannel)
    (java.util Map UUID)))
+
+(def cli-min-version (semver/parse "v0.19.0"))
 
 ;; ---
 ;; Auth helpers
@@ -116,6 +129,12 @@
         (= user-id app-creator-id) :owner
         (stripe/pro-plan? subscription) (get-member-role app-id user-id)))
      {:app app :user user :subscription subscription})))
+
+(defn req->app-and-user-accepting-platform-tokens! [least-privilege scope req]
+  (let [token (http-util/req->bearer-token! req)]
+    (if (token-util/is-platform-token? token)
+      (req->superadmin-user-and-app! scope req)
+      (req->app-and-user! least-privilege req))))
 
 (defn with-team-app-fixtures [role f]
   (fixtures/with-team-app
@@ -191,11 +210,12 @@
   (let [title "Instant"
         {:keys [email]} user
         {:keys [code]} magic-code]
-    {:from (str title " <auth@pm.instantdb.com>")
-     :to email
+    {:from {:name title
+            :email "verify@dash-pm.instantdb.com"}
+     :to [{:email email}]
      :subject (str code " is your verification code for " title)
      :html
-     (postmark/standard-body
+     (email/standard-body
       "<p><strong>Welcome,</strong></p>
        <p>
          You asked to join " title ". To complete your registration, use this
@@ -212,8 +232,8 @@
 
 (comment
   (def user (instant-user-model/get-by-email {:email "stopa@instantdb.com"}))
-  (def m {:code "123123"})
-  (postmark/send! (magic-code-email {:user user :magic-code m})))
+  (def m {:code (string-util/rand-num-str 6)})
+  (postmark/send-structured! (magic-code-email {:user user :magic-code m})))
 
 (defn send-magic-code-post [req]
   (let [email (ex/get-param! req [:body :email] email/coerce)
@@ -224,7 +244,7 @@
                     {:id (UUID/randomUUID)
                      :code (instant-user-magic-code-model/rand-code)
                      :user-id user-id})]
-    (postmark/send!
+    (postmark/send-structured!
      (magic-code-email {:user u :magic-code magic-code}))
     (response/ok {:sent true})))
 
@@ -237,7 +257,7 @@
 
 (defn verify-magic-code-post [req]
   (let [email (ex/get-param! req [:body :email] email/coerce)
-        code (ex/get-param! req [:body :code] string/trim)
+        code (ex/get-param! req [:body :code] string-util/safe-trim)
         {user-id :user_id} (instant-user-magic-code-model/consume!
                             {:code code :email email})
         {refresh-token-id :id} (instant-user-refresh-token-model/create!
@@ -265,12 +285,52 @@
     (assert-admin-email! email)
     (response/ok {:users (dash-admin/get-recent)})))
 
+(defn admin-check-get [req]
+  (let [{:keys [email]} (req->auth-user! req)]
+    (assert-admin-email! email)
+    (response/ok {:ok true})))
+
 (defn admin-top-get [req]
   (let [{:keys [email]} (req->auth-user! req)
         n (get-in req [:params :n])
         n-val (number-util/parse-int n 7)]
     (assert-admin-email! email)
     (response/ok {:users (dash-admin/get-top-users n-val)})))
+
+(defn admin-investor-updates-get [req]
+  (let [{:keys [email]} (req->auth-user! req)
+        _ (assert-admin-email! email)
+        conn (aurora/conn-pool :read)
+        metrics (metrics/investor-update-metrics conn)
+        metrics-with-b64-charts
+        (update metrics :charts (partial medley/map-vals
+                                         (fn [chart] (metrics/chart->base64-png chart
+                                                                                500 400))))]
+    (response/ok {:metrics metrics-with-b64-charts})))
+
+(defn admin-overview-daily-get [req]
+  (let [{:keys [email]} (req->auth-user! req)
+        _ (assert-admin-email! email)
+        conn (aurora/conn-pool :read)
+        overview (metrics/overview-metrics conn)
+        rev-subs (dash-admin/get-revenue-generating-subscriptions)
+        overview-with-b64-charts
+        (update overview :charts (partial medley/map-vals
+                                          (fn [chart] (metrics/chart->base64-png chart
+                                                                                 500 400))))
+        subscription-info {:num-subs (count rev-subs)
+                           :total-monthly-revenue (reduce + (map :monthly-revenue rev-subs))}]
+
+    (response/ok (assoc overview-with-b64-charts
+                        :subscription-info subscription-info))))
+
+(defn admin-overview-minute-get [req]
+  (let [{:keys [email]} (req->auth-user! req)
+        _ (assert-admin-email! email)
+        hz (eph/get-hz)
+        session-reports (machine-summaries/get-all-session-reports hz)]
+    (response/ok
+     {:session-reports session-reports})))
 
 (defn admin-paid-get [req]
   (let [{:keys [email]} (req->auth-user! req)]
@@ -282,6 +342,33 @@
     (assert-admin-email! email)
     (response/ok {:apps (dash-admin/get-storage-metrics)})))
 
+(defn admin-debug-uri-get [req]
+  (let [{:keys [email]} (req->auth-user! req)
+        _ (assert-admin-email! email)
+        trace-id (ex/get-param! req [:params :trace-id] string-util/coerce-non-blank-str)
+        span-id (ex/get-param! req [:params :span-id] string-util/coerce-non-blank-str)]
+
+    ;; Make sure our trace-id and span-id are valid
+    (try
+      (crypt-util/hex-string->bytes trace-id)
+      (catch Exception _
+        (ex/throw+ {::ex/type ::ex/param-malformed
+                    ::ex/message "Invalid trace id"
+                    ::ex/hint {:trace-id trace-id}})))
+    (try
+      (crypt-util/hex-string->bytes span-id)
+      (catch Exception _
+        (ex/throw+ {::ex/type ::ex/param-malformed
+                    ::ex/message "Invalid span id"
+                    ::ex/hint {:span-id span-id}})))
+
+    (response/ok {:urls [{:label "View trace in Honeycomb"
+                          :url (tracer/honeycomb-uri {:trace-id trace-id
+                                                      :span-id span-id})}
+                         {:label "Search trace in Cloudwatch"
+                          :url (tracer/cloudwatch-uri {:trace-id trace-id
+                                                       :span-id span-id})}]})))
+
 ;; ---
 ;; Dash
 
@@ -289,16 +376,11 @@
   (let [{:keys [id email]} (req->auth-user! req)
         apps (app-model/get-all-for-user {:user-id id})
         profile (instant-profile-model/get-by-user-id {:user-id id})
-        invites (instant-app-member-invites-model/get-pending-for-invitee {:email email})
-        whitelist (storage-beta/whitelist)
-        storage-enabled-app-ids (->> apps
-                                     (map :id)
-                                     (filter #(contains? whitelist (str %))))]
+        invites (instant-app-member-invites-model/get-pending-for-invitee {:email email})]
     (response/ok {:apps apps
                   :profile profile
                   :invites invites
-                  :user {:id id :email email}
-                  :flags {:storage_enabled_apps storage-enabled-app-ids}})))
+                  :user {:id id :email email}})))
 
 (comment
   (def u (instant-user-model/get-by-email {:email "stopa@instantdb.com"}))
@@ -315,7 +397,7 @@
     (response/ok {:profile profile})))
 
 (defn apps-post [req]
-  (let [title (ex/get-param! req [:body :title] string/trim)
+  (let [title (ex/get-param! req [:body :title] string-util/coerce-non-blank-str)
         id (ex/get-param! req [:body :id] uuid-util/coerce)
         token (ex/get-param! req [:body :admin_token] uuid-util/coerce)
         {creator-id :id} (req->auth-user! req)
@@ -335,11 +417,11 @@
 
   (app-model/get-all-for-user {:user-id (:id u)})
 
-  (app-model/delete-by-id! {:id app-id}))
+  (app-model/delete-immediately-by-id! {:id app-id}))
 
 (defn apps-delete [req]
   (let [{{app-id :id} :app} (req->app-and-user! req)]
-    (app-model/delete-by-id! {:id app-id})
+    (app-model/mark-for-deletion! {:id app-id})
     (response/ok {:ok true})))
 
 (defn apps-clear [req]
@@ -348,7 +430,7 @@
     (response/ok {:ok true})))
 
 (defn admin-tokens-regenerate [req]
-  (let [{{app-id :id} :app} (req->app-and-user! req)
+  (let [{{app-id :id} :app} (req->app-and-user! :admin req)
         admin-token (ex/get-param! req [:body :admin-token] uuid-util/coerce)]
     (response/ok (app-admin-token-model/recreate! {:app-id app-id
                                                    :token admin-token}))))
@@ -357,7 +439,9 @@
 ;; Rules
 
 (defn rules-post [req]
-  (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)
+  (let [{{app-id :id} :app} (req->app-and-user-accepting-platform-tokens! :collaborator
+                                                                          :apps/write
+                                                                          req)
         code (ex/get-param! req [:body :code] w/stringify-keys)]
     (ex/assert-valid! :rule code (rule-model/validation-errors code))
     (response/ok {:rules (rule-model/put! {:app-id app-id
@@ -648,16 +732,6 @@
 
 (def default-subscription "Free")
 
-(defn calculate-storage-usage [app-id]
-  (let [objects-resp (s3-util/list-app-objects app-id)
-        objects (:object-summaries objects-resp)
-        usage (reduce (fn [acc obj] (+ acc (:size obj))) 0 objects)]
-    usage))
-
-(comment
-  (def app-id  #uuid "524bc106-1f0d-44a0-b222-923505264c47")
-  (calculate-storage-usage app-id))
-
 (defn checkout-session-post [req]
   (let [{{app-id :id app-title :title} :app
          {user-id :id user-email :email :as user} :user} (req->app-and-user! req)
@@ -697,7 +771,7 @@
         {subscription-name :name stripe-subscription-id :stripe_subscription_id}
         (instant-subscription-model/get-by-app-id {:app-id app-id})
         {total-app-bytes :num_bytes} (app-model/app-usage {:app-id app-id})
-        total-storage-bytes (calculate-storage-usage app-id)]
+        total-storage-bytes (:total_byte_size (app-file-model/get-app-usage app-id))]
     (response/ok {:subscription-name (or subscription-name default-subscription)
                   :stripe-subscription-id stripe-subscription-id
                   :total-app-bytes total-app-bytes
@@ -759,7 +833,7 @@
         {:keys [invitee_role status app_id invitee_email]} (instant-app-member-invites-model/get-by-id! {:id invite-id})]
     (ex/assert-permitted! :invitee? invitee_email (= invitee_email user-email))
     (ex/assert-permitted! :acceptable? invite-id (not= status "revoked"))
-    (next-jdbc/with-transaction [tx-conn (aurora/conn-pool)]
+    (next-jdbc/with-transaction [tx-conn (aurora/conn-pool :write)]
       (instant-app-member-invites-model/accept-by-id! tx-conn {:id invite-id})
       (condp = invitee_role
         "creator"
@@ -845,15 +919,16 @@
 (defn personal-access-tokens-get [req]
   (let [{user-id :id} (req->auth-user! req)
         personal-access-tokens (instant-personal-access-token-model/list-by-user-id! {:user-id user-id})]
-    (response/ok {:data personal-access-tokens})))
+    (response/ok {:data (map instant-personal-access-token-model/format-token-for-api
+                             personal-access-tokens)})))
 
 (defn personal-access-tokens-post [req]
   (let [{user-id :id} (req->auth-user! req)
         name (ex/get-param! req [:body :name] string-util/coerce-non-blank-str)
-        personal-access-tokens (instant-personal-access-token-model/create! {:id (UUID/randomUUID)
-                                                                             :user-id user-id
-                                                                             :name name})]
-    (response/ok {:data personal-access-tokens})))
+        personal-access-token (instant-personal-access-token-model/create! {:user-id user-id
+                                                                            :name name})]
+    (response/ok {:data (instant-personal-access-token-model/format-token-for-api
+                         personal-access-token)})))
 
 (defn personal-access-tokens-delete [req]
   (let [{user-id :id} (req->auth-user! req)
@@ -870,8 +945,21 @@
   (personal-access-tokens-get {:headers headers})
   (personal-access-tokens-delete {:headers headers :params {:id (-> record :body :data :id)}}))
 
-;; --- 
+;; ---------------
 ;; Email templates
+
+(defn sender-verification-get [req]
+  (let [{{app-id :id} :app} (req->app-and-user! :admin req)
+        {postmark-id :postmark_id}
+        (app-email-template-model/get-by-app-id-and-email-type
+         {:app-id app-id :email-type "magic-code"})]
+    (response/ok {:verification (when postmark-id
+                                  (-> (postmark/get-sender! {:id postmark-id})
+                                      :body
+                                      (select-keys [:ID :EmailAddress :Confirmed
+                                                    :DKIMHost :DKIMPendingHost
+                                                    :DKIMPendingTextValue :DKIMTextValue
+                                                    :ReturnPathDomain :ReturnPathDomainCNAMEValue])))})))
 
 (defn email-template-post [req]
   (let [{app :app user :user} (req->app-and-user! :admin req)
@@ -931,59 +1019,45 @@
 ;; ---
 ;; Storage
 
-(defn signed-download-url-get [req]
-  (let [filename (ex/get-param! req [:params :filename] string-util/coerce-non-blank-str)
-        {{app-id :id} :app} (req->app-and-user! :collaborator req)
-        data (storage-util/create-signed-download-url! app-id filename)]
-    (response/ok {:data data})))
-
-(defn signed-upload-url-post [req]
-  (let [filename (ex/get-param! req [:body :filename] string-util/coerce-non-blank-str)
-        {{app-id :id} :app} (req->app-and-user! :collaborator req)
-        data (storage-util/create-signed-upload-url! app-id filename)]
-    (response/ok {:data data})))
-
-;; Retrieves all files that have been uploaded via Storage APIs
-(defn files-get [req]
+(defn upload-put [req]
   (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)
-        subdirectory (-> req :params :subdirectory)
-        data (storage-util/list-files! app-id subdirectory)]
+        params (:headers req)
+        path (ex/get-param! params ["path"] string-util/coerce-non-blank-str)
+        file (ex/get-param! req [:body] identity)
+        data (storage-coordinator/upload-file!
+              {:app-id app-id
+               :path path
+               :file file
+               :content-type (:content-type req)
+               :content-length (:content-length req)
+               :skip-perms-check? true}
+              file)]
     (response/ok {:data data})))
 
-;; Deletes a single file by name/path (e.g. "demo.png", "profiles/me.jpg")
-(defn file-delete [req]
-  (let [filename (ex/get-param! req [:params :filename] string-util/coerce-non-blank-str)
-        {{app-id :id} :app} (req->app-and-user! :collaborator req)
-        data (storage-util/delete-file! app-id filename)]
-    (response/ok {:data data})))
-
-;; Deletes a multiple files by name/path (e.g. "demo.png", "profiles/me.jpg")
 (defn files-delete [req]
-  (let [filenames (ex/get-param! req [:body :filenames] seq)
+  (let [filenames (ex/get-param! req [:body :filenames] vec)
         {{app-id :id} :app} (req->app-and-user! :collaborator req)
-        data (storage-util/bulk-delete-files! app-id filenames)]
+        data (storage-coordinator/delete-files! {:app-id app-id
+                                                 :paths filenames})]
     (response/ok {:data data})))
-
-(comment
-  (def app-id  #uuid "524bc106-1f0d-44a0-b222-923505264c47")
-  (def user (instant-user-model/get-by-email {:email "alex@instantdb.com"}))
-  (def guest (instant-user-model/get-by-email {:email "stopa@instantdb.com"}))
-  (def refresh-token (instant-user-refresh-token-model/create! {:id (UUID/randomUUID) :user-id (:id user)}))
-  (def guest-refresh-token (instant-user-refresh-token-model/create! {:id (UUID/randomUUID) :user-id (:id guest)}))
-  (files-get {:params {:app_id app-id}
-              :headers {"authorization" (str "Bearer " (:id refresh-token))}})
-  (files-get {:params {:app_id app-id}
-              :headers {"authorization" (str "Bearer " (:id guest-refresh-token))}})
-  (file-delete {:params {:app_id app-id :filename "pika.webp"}
-                :headers {"authorization" (str "Bearer " (:id refresh-token))}}))
 
 ;; ---
 ;; CLI
 
+(defn- remove-system-namespaces [entities]
+  (ucoll/filter-keys
+   #(not (system-catalog/reserved? (name %)))
+   entities))
+
 (defn schema-push-plan-post [req]
-  (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)
-        client-defs (-> req :body :schema)
-        check-types? (-> req :body :check_types)
+  (let [{{app-id :id} :app} (req->app-and-user-accepting-platform-tokens! :collaborator
+                                                                          :apps/read
+                                                                          req)
+        client-defs         (-> req
+                                :body
+                                :schema
+                                (update :entities remove-system-namespaces))
+        check-types?        (-> req :body :check_types)
         background-updates? (-> req :body :supports_background_updates)]
     (response/ok (schema-model/plan! {:app-id app-id
                                       :check-types? check-types?
@@ -991,9 +1065,14 @@
                                      client-defs))))
 
 (defn schema-push-apply-post [req]
-  (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)
-        client-defs (-> req :body :schema)
-        check-types? (-> req :body :check_types)
+  (let [{{app-id :id} :app} (req->app-and-user-accepting-platform-tokens! :collaborator
+                                                                          :apps/write
+                                                                          req)
+        client-defs         (-> req
+                                :body
+                                :schema
+                                (update :entities remove-system-namespaces))
+        check-types?        (-> req :body :check_types)
         background-updates? (-> req :body :supports_background_updates)
         r (schema-model/plan! {:app-id app-id
                                :check-types? check-types?
@@ -1003,13 +1082,17 @@
     (response/ok (merge r plan-result))))
 
 (defn schema-pull-get [req]
-  (let [{{app-id :id app-title :title} :app} (req->app-and-user! :collaborator req)
+  (let [{{app-id :id app-title :title} :app} (req->app-and-user-accepting-platform-tokens! :collaborator
+                                                                                           :apps/read
+                                                                                           req)
         current-attrs (attr-model/get-by-app-id app-id)
         current-schema (schema-model/attrs->schema current-attrs)]
     (response/ok {:schema current-schema :app-title app-title})))
 
 (defn perms-pull-get [req]
-  (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)
+  (let [{{app-id :id} :app} (req->app-and-user-accepting-platform-tokens! :collaborator
+                                                                          :apps/write
+                                                                          req)
         perms (rule-model/get-by-app-id {:app-id app-id})
         r {:perms (:code perms)}]
     (response/ok r)))
@@ -1024,7 +1107,9 @@
     (response/ok {:job job})))
 
 (defn indexing-jobs-group-get [req]
-  (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)
+  (let [{{app-id :id} :app} (req->app-and-user-accepting-platform-tokens! :collaborator
+                                                                          :apps/write
+                                                                          req)
         group-id (ex/get-param! req [:params :group_id] uuid-util/coerce)
         jobs (indexing-jobs/get-by-group-id-for-client app-id group-id)]
     (response/ok {:jobs jobs})))
@@ -1035,13 +1120,7 @@
         job-type (ex/get-param! req
                                 [:body :job-type]
                                 string-util/coerce-non-blank-str)
-        _ (when-not (contains? #{"check-data-type"
-                                 "remove-data-type"
-                                 "index"
-                                 "remove-index"
-                                 "unique"
-                                 "remove-unique"}
-                               job-type)
+        _ (when-not (contains? indexing-jobs/jobs job-type)
             (ex/throw-validation-err! :job-type
                                       job-type
                                       [{:message (format "Invalid job type %s." job-type)}]))
@@ -1050,38 +1129,19 @@
                                 :attrs
                                 {:attr-id attr-id})
 
-        job (ex/assert-record! (case job-type
-                                 "check-data-type"
-                                 (indexing-jobs/create-check-data-type-job!
-                                  {:app-id app-id
-                                   :attr-id (:id attr)
-                                   :checked-data-type
-                                   (ex/get-param! req
-                                                  [:body :checked-data-type]
-                                                  string-util/coerce-non-blank-str)})
-
-                                 "remove-data-type"
-                                 (indexing-jobs/create-remove-data-type-job!
-                                  {:app-id app-id :attr-id (:id attr)})
-
-                                 "index"
-                                 (indexing-jobs/create-index-job!
-                                  {:app-id app-id :attr-id (:id attr)})
-
-                                 "remove-index"
-                                 (indexing-jobs/create-remove-index-job!
-                                  {:app-id app-id :attr-id (:id attr)})
-
-                                 "unique"
-                                 (indexing-jobs/create-unique-job!
-                                  {:app-id app-id :attr-id (:id attr)})
-
-                                 "remove-unique"
-                                 (indexing-jobs/create-remove-unique-job!
-                                  {:app-id app-id :attr-id (:id attr)}))
-                               :indexing-job
-                               {:attr-id attr-id
-                                :job-type job-type})]
+        job (ex/assert-record!
+             (indexing-jobs/create-job!
+              (cond-> {:app-id app-id
+                       :attr-id (:id attr)
+                       :job-type job-type}
+                (= "check-data-type" job-type)
+                (assoc :checked-data-type
+                       (ex/get-param! req
+                                      [:body :checked-data-type]
+                                      string-util/coerce-non-blank-str))))
+             :indexing-job
+             {:attr-id attr-id
+              :job-type job-type})]
     (indexing-jobs/enqueue-job job)
     (response/ok {:job (indexing-jobs/job->client-format job)})))
 
@@ -1098,14 +1158,14 @@
   (schema-push-plan-post {:params {:app_id counters-app-id}
                           :headers {"authorization" (str "Bearer " (:id r))}}))
 
-;; --- 
+;; --------
 ;; CLI auth
 
 (defn cli-auth-register-post [_]
   (let [secret (UUID/randomUUID)
         ticket (UUID/randomUUID)]
     (instant-cli-login-model/create!
-     (aurora/conn-pool)
+     (aurora/conn-pool :write)
      {:secret secret
       :ticket ticket})
     (response/ok {:secret secret :ticket ticket})))
@@ -1113,18 +1173,18 @@
 (defn cli-auth-claim-post [req]
   (let [{user-id :id} (req->auth-user! req)
         ticket (ex/get-param! req [:body :ticket] uuid-util/coerce)]
-    (instant-cli-login-model/claim! (aurora/conn-pool) {:user-id user-id :ticket ticket})
+    (instant-cli-login-model/claim! (aurora/conn-pool :write) {:user-id user-id :ticket ticket})
     (response/ok {:ticket ticket})))
 
 (defn cli-auth-void-post [req]
   (let [_ (req->auth-user! req)
         ticket (ex/get-param! req [:body :ticket] uuid-util/coerce)]
-    (instant-cli-login-model/void! (aurora/conn-pool) {:ticket ticket})
+    (instant-cli-login-model/void! (aurora/conn-pool :write) {:ticket ticket})
     (response/ok {})))
 
 (defn cli-auth-check-post [req]
   (let [secret (ex/get-param! req [:body :secret] uuid-util/coerce)
-        cli-auth (instant-cli-login-model/use! (aurora/conn-pool) {:secret secret})
+        cli-auth (instant-cli-login-model/use! (aurora/conn-pool :write) {:secret secret})
         user-id (:user_id cli-auth)
         refresh-token (instant-user-refresh-token-model/create! {:id (UUID/randomUUID) :user-id user-id})
         token (:id refresh-token)
@@ -1132,19 +1192,19 @@
         res {:token token :email email}]
     (response/ok res)))
 
-;; --- 
-;; WS playground 
+;; -------------
+;; WS playground
 
 (def id-atom (atom 0))
 (defn ws-playground-get
-  "This is a simple websocket playground, to play with undertow's websocket behavior. 
-  
-   To try it out, 
+  "This is a simple websocket playground, to play with undertow's websocket behavior.
+
+   To try it out,
    ```bash
-   brew install websocat 
-   websocat ws://localhost:8888/dash/ws_playground 
-   hi 
-   break 
+   brew install websocat
+   websocat ws://localhost:8888/dash/ws_playground
+   hi
+   break
    ```"
   [_]
   (let [id (swap! id-atom inc)]
@@ -1177,15 +1237,298 @@
     (instant-user-refresh-token-model/delete-by-id! {:id token})
     (response/ok {})))
 
+(def active-session-cache (cache/ttl-cache-factory {} :ttl 5000))
+
+(defn get-total-count-cached []
+  (cache/lookup-or-miss active-session-cache
+                        :total-count
+                        (fn [_]
+                          (->> (machine-summaries/get-all-num-sessions (eph/get-hz))
+                               vals
+                               (reduce +)))))
+
+(defn active-sessions-get [_]
+  (response/ok {:total-count (get-total-count-cached)}))
+
+(defn oauth-apps-get [req]
+  (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)]
+    (response/ok (oauth-app-model/get-for-dash {:app-id app-id}))))
+
+(defn oauth-apps-post
+  "Creates a new OAuth platform app."
+  [req]
+  (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)
+        app-name (ex/get-param! req
+                                [:body :app_name]
+                                string-util/coerce-non-blank-str)
+        app-logo-base64-url (ex/get-optional-param! req
+                                                    [:body :app_logo]
+                                                    string-util/coerce-non-blank-str)
+        app-logo-bytes (when app-logo-base64-url
+                         (try
+                           (oauth-app-model/base64-image-url->bytes app-logo-base64-url)
+                           (catch Exception e
+                             (ex/throw+ {::ex/type ::ex/param-malformed
+                                         ::ex/message
+                                         (case (.getMessage e)
+                                           "Invalid image url" "Invalid image url"
+                                           "Invalid mime type" "Invalid image type"
+                                           "Image is too large" "Image is too large"
+                                           "Invalid image type" "Invalid image type"
+                                           "Invalid image")}))))
+        support-email (ex/get-optional-param! req
+                                              [:body :support_email]
+                                              string-util/coerce-non-blank-str)
+        app-home-page (ex/get-optional-param! req
+                                              [:body :app_home_page]
+                                              url-util/coerce-web-url)
+        app-privacy-policy-link (ex/get-optional-param! req
+                                                        [:body :app_privacy_policy_link]
+                                                        url-util/coerce-web-url)
+        app-tos-link (ex/get-optional-param! req
+                                             [:body :app_tos_link]
+                                             url-util/coerce-web-url)
+
+        create-res (oauth-app-model/create-app {:app-id app-id
+                                                :app-name app-name
+                                                :support-email support-email
+                                                :app-home-page app-home-page
+                                                :app-privacy-policy-link app-privacy-policy-link
+                                                :app-tos-link app-tos-link
+                                                :app-logo app-logo-bytes})]
+
+    (response/ok {:app (oauth-app-model/format-oauth-app-for-api create-res)})))
+
+(defn oauth-app-post
+  "Updates an existing OAuth platform app.
+   Uses access to the Instant app as a permission guard for the oauth
+   app."
+  [req]
+  (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)
+        oauth-app-id-unverified (ex/get-param! req
+                                               [:params :oauth_app_id]
+                                               uuid-util/coerce)
+        app-name (ex/get-optional-param! req
+                                         [:body :app_name]
+                                         string-util/coerce-non-blank-str)
+        app-logo-base64-url (ex/get-optional-param! req
+                                                    [:body :app_logo]
+                                                    string-util/coerce-non-blank-str)
+        app-logo-bytes (when app-logo-base64-url
+                         (try
+                           (oauth-app-model/base64-image-url->bytes app-logo-base64-url)
+                           (catch Exception e
+                             (ex/throw+ {::ex/type ::ex/param-malformed
+                                         ::ex/message
+                                         (case (.getMessage e)
+                                           "Invalid image url" "Invalid image url"
+                                           "Invalid mime type" "Invalid image type"
+                                           "Image is too large" "Image is too large"
+                                           "Invalid image type" "Invalid image type"
+                                           "Invalid image")}))))
+        support-email (ex/get-optional-param! req
+                                              [:body :support_email]
+                                              string-util/coerce-non-blank-str)
+        app-home-page (ex/get-optional-param! req
+                                              [:body :app_home_page]
+                                              url-util/coerce-web-url)
+        app-privacy-policy-link (ex/get-optional-param! req
+                                                        [:body :app_privacy_policy_link]
+                                                        url-util/coerce-web-url)
+        app-tos-link (ex/get-optional-param! req
+                                             [:body :app_tos_link]
+                                             url-util/coerce-web-url)
+
+        oauth-app (oauth-app-model/update-app! {:oauth-app-id-unverified oauth-app-id-unverified
+                                                :app-id app-id
+                                                :app-name app-name
+                                                :support-email support-email
+                                                :app-home-page app-home-page
+                                                :app-privacy-policy-link app-privacy-policy-link
+                                                :app-tos-link app-tos-link
+                                                :app-logo app-logo-bytes})]
+
+    (response/ok {:app (oauth-app-model/format-oauth-app-for-api oauth-app)})))
+
+(defn oauth-app-delete
+  "Deletes an existing OAuth app.
+   Uses access to the Instant app as a permission guard for the oauth
+   app."
+  [req]
+  (let [{{app-id :id} :app} (req->app-and-user! :admin req)
+        oauth-app-id-unverified (ex/get-param! req
+                                               [:params :oauth_app_id]
+                                               uuid-util/coerce)
+        oauth-app (oauth-app-model/delete-app! {:oauth-app-id-unverified oauth-app-id-unverified
+                                                :app-id app-id})]
+
+    (response/ok {:app (oauth-app-model/format-oauth-app-for-api oauth-app)})))
+
+(defn oauth-app-client-delete
+  "Deletes an existing OAuth app client.
+   Uses access to the Instant app as a permission guard for the oauth
+   app client."
+  [req]
+  (let [{{app-id :id} :app} (req->app-and-user! :admin req)
+        client-id-unverified (ex/get-param! req
+                                            [:params :client_id]
+                                            uuid-util/coerce)
+        client (oauth-app-model/delete-client! {:client-id-unverified client-id-unverified
+                                                :app-id app-id})]
+
+    (response/ok {:client (oauth-app-model/format-client-for-api client)})))
+
+(defn oauth-app-clients-post
+  "Create a new OAuth client for an OAuth app.
+   Uses access to the Instant app as a permission guard for the oauth
+   app client."
+  [req]
+  (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)
+        oauth-app-id-unverified (ex/get-param! req
+                                               [:params :oauth_app_id]
+                                               uuid-util/coerce)
+        oauth-app (oauth-app-model/get-oauth-app-by-id-and-app-id!
+                   {:app-id app-id
+                    :oauth-app-id-unverified oauth-app-id-unverified})
+        client-name (ex/get-param! req
+                                   [:body :client_name]
+                                   string-util/coerce-non-blank-str)
+        authorized-redirect-urls (ex/get-optional-param! req
+                                                         [:body :authorized_redirect_urls]
+                                                         #(when (coll? %) %))
+
+        _ (run! (fn [redirect-url]
+                  (ex/assert-valid!
+                   :authorized_redirect_urls
+                   redirect-url
+                   (url-util/redirect-url-validation-errors
+                    redirect-url
+                    :allow-localhost? (not (:is_public oauth-app)))))
+                authorized-redirect-urls)
+        {:keys [client client-secret secret-value]}
+        (oauth-app-model/create-client {:app-id app-id
+                                        :oauth-app-id (:id oauth-app)
+                                        :client-name client-name
+                                        :authorized-redirect-urls authorized-redirect-urls})]
+
+    (response/ok {:client (oauth-app-model/format-client-for-api client)
+                  :clientSecret (oauth-app-model/format-client-secret-for-api client-secret)
+                  :secretValue secret-value})))
+
+(defn oauth-app-client-post
+  "Update an existing OAuth app client.
+   Uses access to the Instant app as a permission guard for the oauth
+   app client."
+  [req]
+  (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)
+        client-id-unverified (ex/get-param! req
+                                            [:params :client_id]
+                                            uuid-util/coerce)
+        oauth-app (oauth-app-model/get-oauth-app-by-client-id-and-app-id!
+                   {:app-id app-id
+                    :client-id-unverified client-id-unverified})
+        client-name (ex/get-optional-param! req
+                                            [:body :client_name]
+                                            string-util/coerce-non-blank-str)
+        add-redirect-url (ex/get-optional-param! req
+                                                 [:body :add_redirect_url]
+                                                 string-util/coerce-non-blank-str)
+
+        _ (when add-redirect-url
+            (ex/assert-valid!
+             :authorized_redirect_urls
+             add-redirect-url
+             (url-util/redirect-url-validation-errors
+              add-redirect-url
+              :allow-localhost? (not (:is_public oauth-app)))))
+        remove-redirect-url (ex/get-optional-param! req
+                                                    [:body :remove_redirect_url]
+                                                    string-util/coerce-non-blank-str)
+        client (oauth-app-model/update-client! {:app-id app-id
+                                                :client-id-unverified client-id-unverified
+                                                :client-name client-name
+                                                :add-redirect-url add-redirect-url
+                                                :remove-redirect-url remove-redirect-url})]
+    (response/ok {:client (oauth-app-model/format-client-for-api client)})))
+
+(defn oauth-app-client-secrets
+  "Create a new OAuth app client secret.
+   Uses access to the Instant app as a permission guard for the oauth
+   app client."
+  [req]
+  (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)
+        client-id-unauthed (ex/get-param! req
+                                          [:params :client_id]
+                                          uuid-util/coerce)
+        {:keys [record secret-value]} (oauth-app-model/create-client-secret-by-client-id-and-app-id!
+                                       {:app-id app-id
+                                        :client-id client-id-unauthed})]
+
+    (response/ok {:clientSecret (oauth-app-model/format-client-secret-for-api
+                                 record)
+                  :secretValue secret-value})))
+
+(defn oauth-app-client-secret-delete
+  "Delete an existing OAuth app client secret.
+   Uses access to the Instant app as a permission guard for the oauth
+   app client secret."
+  [req]
+  (let [{{app-id :id} :app} (req->app-and-user! :collaborator req)
+        client-secret-id-unauthed (ex/get-param! req
+                                                 [:params :client_secret_id]
+                                                 uuid-util/coerce)
+        client-secret (oauth-app-model/delete-client-secret-by-id-and-app-id!
+                       {:app-id app-id
+                        :client-secret-id client-secret-id-unauthed})]
+
+    (response/ok {:clientSecret (oauth-app-model/format-client-secret-for-api
+                                 client-secret)})))
+
+(defn authorized-oauth-apps [user-id]
+  (let [oauth-apps (oauth-app-model/user-authorized {:user-id user-id})]
+    (sort-by :name
+             (map (fn [app]
+                    {:id (:id app)
+                     :name (:app_name app)
+                     :logo (some-> app
+                                   :app_logo
+                                   oauth-app-model/bytes->base64-image-url)
+                     :homePage (:app_home_page app)
+                     :privacyPolicyLink (:app_privacy_policy_link app)
+                     :tosLink (:app_tos_link app)})
+                  oauth-apps))))
+
+(defn user-oauth-apps-get [req]
+  (let [user (req->auth-user! req)]
+    (response/ok {:oauthApps (authorized-oauth-apps (:id user))})))
+
+(defn user-oauth-apps-revoke-access [req]
+  (let [user (req->auth-user! req)
+        oauth-app-id (ex/get-param! req
+                                    [:body :oauthAppId]
+                                    uuid-util/coerce)]
+    (tracer/with-span! {:name "revoke-oauth-app"
+                        :attributes {:user-id (:id user)
+                                     :oauth-app-id oauth-app-id}}
+      (let [revoked-tokens (oauth-app-model/revoke-app-for-user {:user-id (:id user)
+                                                                 :oauth-app-id oauth-app-id})]
+        (tracer/add-data! {:attributes {:revoked-token-count (count revoked-tokens)}})))
+    (response/ok {:oauthApps (authorized-oauth-apps (:id user))})))
+
 (defroutes routes
   (POST "/dash/auth/send_magic_code" [] send-magic-code-post)
   (POST "/dash/auth/verify_magic_code" [] verify-magic-code-post)
   (GET "/dash/admin" [] admin-get)
 
   ;; internal admin routes
+  (GET "/dash/check-admin" [] admin-check-get)
   (GET "/dash/top" [] admin-top-get)
   (GET "/dash/paid" [] admin-paid-get)
   (GET "/dash/storage" [] admin-storage-get)
+  (GET "/dash/investor_updates" [] admin-investor-updates-get)
+  (GET "/dash/overview/daily" [] admin-overview-daily-get)
+  (GET "/dash/overview/minute" [] admin-overview-minute-get)
+  (GET "/dash/admin-debug-uri" [] admin-debug-uri-get)
 
   (GET "/dash" [] dash-get)
   (POST "/dash/apps" [] apps-post)
@@ -1219,6 +1562,8 @@
   (POST "/dash/cli/auth/claim" [] cli-auth-claim-post)
   (POST "/dash/cli/auth/void" [] cli-auth-void-post)
 
+  (GET "/dash/cli/version" [] (response/ok {:min-version cli-min-version}))
+
   (GET "/dash/session_counts" [] session-counts-get)
 
   (POST "/dash/apps/:app_id/checkout_session" [] checkout-session-post)
@@ -1231,6 +1576,7 @@
   (DELETE "/dash/apps/:app_id/members/remove" [] team-member-remove-delete)
   (POST "/dash/apps/:app_id/members/update" [] team-member-update-post)
 
+  (GET "/dash/apps/:app_id/sender-verification" [] sender-verification-get)
   (POST "/dash/apps/:app_id/email_templates" [] email-template-post)
   (DELETE "/dash/apps/:app_id/email_templates/:id" [] email-template-delete)
 
@@ -1243,11 +1589,9 @@
 
   (POST "/dash/apps/:app_id/rename" [] app-rename-post)
 
-  (POST "/dash/apps/:app_id/storage/signed-upload-url" [] signed-upload-url-post)
-  (GET "/dash/apps/:app_id/storage/signed-download-url", [] signed-download-url-get)
-  (GET "/dash/apps/:app_id/storage/files" [] files-get)
-  (DELETE "/dash/apps/:app_id/storage/files" [] file-delete) ;; single delete
-  (POST "/dash/apps/:app_id/storage/files/delete" [] files-delete) ;; bulk delete
+  ;; Storage
+  (PUT "/dash/apps/:app_id/storage/upload", [] upload-put)
+  (POST "/dash/apps/:app_id/storage/files/delete" [] files-delete)
 
   (POST "/dash/apps/:app_id/schema/push/plan" [] schema-push-plan-post)
   (POST "/dash/apps/:app_id/schema/push/apply" [] schema-push-apply-post)
@@ -1260,4 +1604,20 @@
 
   (GET "/dash/ws_playground" [] ws-playground-get)
 
-  (POST "/dash/signout" [] signout))
+  (POST "/dash/signout" [] signout)
+
+  (GET "/dash/stats/active_sessions" [] active-sessions-get)
+
+  (GET "/dash/apps/:app_id/oauth-apps" [] oauth-apps-get)
+  (POST "/dash/apps/:app_id/oauth-apps" [] oauth-apps-post)
+  (POST "/dash/apps/:app_id/oauth-apps/:oauth_app_id" [] oauth-app-post)
+  (DELETE "/dash/apps/:app_id/oauth-apps/:oauth_app_id" [] oauth-app-delete)
+
+  (POST "/dash/apps/:app_id/oauth-apps/:oauth_app_id/clients" [] oauth-app-clients-post)
+  (POST "/dash/apps/:app_id/oauth-app-clients/:client_id" [] oauth-app-client-post)
+  (DELETE "/dash/apps/:app_id/oauth-app-clients/:client_id" [] oauth-app-client-delete)
+  (POST "/dash/apps/:app_id/oauth-app-clients/:client_id/client-secrets" [] oauth-app-client-secrets)
+  (DELETE "/dash/apps/:app_id/oauth-app-client-secrets/:client_secret_id" [] oauth-app-client-secret-delete)
+
+  (GET "/dash/user/oauth_apps" [] user-oauth-apps-get)
+  (POST "/dash/user/oauth_apps/revoke_access" [] user-oauth-apps-revoke-access))

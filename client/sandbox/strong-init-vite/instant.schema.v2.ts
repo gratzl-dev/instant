@@ -1,9 +1,10 @@
-import { i } from "@instantdb/react";
+import { i } from '@instantdb/react';
 
 const _schema = i.schema({
   entities: {
     messages: i.entity({
       content: i.string(),
+      createdAt: i.date().optional(),
     }),
     $users: i.entity({
       email: i.string().unique().indexed(),
@@ -12,14 +13,14 @@ const _schema = i.schema({
   links: {
     messageCreator: {
       forward: {
-        on: "messages",
-        has: "one",
-        label: "creator",
+        on: 'messages',
+        has: 'one',
+        label: 'creator',
       },
       reverse: {
-        on: "$users",
-        has: "many",
-        label: "createdMessages",
+        on: '$users',
+        has: 'many',
+        label: 'createdMessages',
       },
     },
   },
@@ -40,7 +41,7 @@ const _schema = i.schema({
   },
 });
 
-export type EmojiName = "fire" | "wave" | "confetti" | "heart";
+export type EmojiName = 'fire' | 'wave' | 'confetti' | 'heart';
 
 type _AppSchema = typeof _schema;
 

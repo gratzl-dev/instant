@@ -7,9 +7,9 @@ import React, {
 } from 'react';
 import {
   ChevronRightIcon,
-  ClipboardCopyIcon,
+  ClipboardDocumentIcon,
   PlusIcon,
-} from '@heroicons/react/outline';
+} from '@heroicons/react/24/outline';
 import format from 'date-fns/format';
 import CopyToClipboard from 'react-copy-to-clipboard';
 
@@ -21,9 +21,12 @@ import {
   Button,
   Checkbox,
   cn,
+  Content,
+  Copyable,
   Dialog,
   Label,
   SectionHeading,
+  SubsectionHeading,
 } from '@/components/ui';
 import { TokenContext } from '@/lib/contexts';
 import { errorToast, successToast } from '@/lib/toast';
@@ -35,7 +38,7 @@ type PersonalAccessToken = {
 };
 
 async function fetchPersonalAccessTokens(
-  token: string
+  token: string,
 ): Promise<PersonalAccessToken[]> {
   const { data } = await jsonFetch(
     `${config.apiURI}/dash/personal_access_tokens`,
@@ -45,16 +48,16 @@ async function fetchPersonalAccessTokens(
         'content-type': 'application/json',
         authorization: `Bearer ${token}`,
       },
-    }
+    },
   );
 
   return data;
 }
 
-async function createPersonalAccessTokens(
+async function createPersonalAccessToken(
   token: string,
-  name: string
-): Promise<PersonalAccessToken[]> {
+  name: string,
+): Promise<PersonalAccessToken & { token: string }> {
   const { data } = await jsonFetch(
     `${config.apiURI}/dash/personal_access_tokens`,
     {
@@ -64,7 +67,7 @@ async function createPersonalAccessTokens(
         authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({ name }),
-    }
+    },
   );
 
   return data;
@@ -72,7 +75,7 @@ async function createPersonalAccessTokens(
 
 async function deletePersonalAccessToken(
   token: string,
-  personalAccessTokenId: string
+  personalAccessTokenId: string,
 ): Promise<any> {
   const { data } = await jsonFetch(
     `${config.apiURI}/dash/personal_access_tokens/${personalAccessTokenId}`,
@@ -82,14 +85,14 @@ async function deletePersonalAccessToken(
         'content-type': 'application/json',
         authorization: `Bearer ${token}`,
       },
-    }
+    },
   );
 
   return data;
 }
 
 function usePersonalAccessTokens(
-  token: string
+  token: string,
 ): [PersonalAccessToken[], boolean, any, () => Promise<void>] {
   const [isLoading, setIsLoading] = useState(true);
   const [personalAccessTokens, setPersonalAccessTokens] = useState<
@@ -139,7 +142,7 @@ function CopyButton({ value }: { value: string }) {
         size="mini"
         onClick={handleClick}
       >
-        {!isCopied && <ClipboardCopyIcon className="-ml-0.5 h-4 w-4" />}
+        {!isCopied && <ClipboardDocumentIcon className="-ml-0.5 h-4 w-4" />}
         {isCopied ? 'Copied!' : 'Copy'}
       </Button>
     </CopyToClipboard>
@@ -174,29 +177,60 @@ function CopyText({
   );
 }
 
+function CopyTokenDialog({
+  token,
+  onClose,
+}: {
+  token: string;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog open={Boolean(token)} onClose={onClose}>
+      <SubsectionHeading>Copy your token</SubsectionHeading>
+      <div className="flex flex-col gap-2 p-2">
+        <Content>
+          <p>
+            Copy and save your token somewhere safe. Instant does not keep a
+            copy of the token. You will have to generate a new token if this one
+            is lost.
+          </p>
+        </Content>
+        <div>
+          <Copyable value={token} label="Token" defaultHidden={true} />
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
 export default function PersonalAccessTokensTab({
   className,
 }: {
   className?: string;
 }) {
-  const token = useContext(TokenContext);
+  const authToken = useContext(TokenContext);
   const [
     personalAccessTokens = [],
     isLoadingPersonalAccessTokens,
     personalAccessTokensError,
     refreshPersonalAccessTokens,
-  ] = usePersonalAccessTokens(token);
+  ] = usePersonalAccessTokens(authToken);
   const [isCreatingNewToken, setIsCreatingNewToken] = useState(false);
   const [newPersonalAccessTokenName, setNewPersonalAccessTokenName] =
     useState('Platform Token');
+  const [newTokenValue, setNewTokenValue] = useState<string | null>(null);
 
   const handleGenerateNewToken = async () => {
     try {
-      await createPersonalAccessTokens(token, newPersonalAccessTokenName);
+      const token = await createPersonalAccessToken(
+        authToken,
+        newPersonalAccessTokenName,
+      );
       await refreshPersonalAccessTokens();
       setIsCreatingNewToken(false);
       setNewPersonalAccessTokenName('');
       successToast(`Successfully generated "${newPersonalAccessTokenName}"`);
+      setNewTokenValue(token.token);
     } catch (err: any) {
       console.error('Failed to create token:', err);
       errorToast(`Failed to create token: ${err.body.message}`);
@@ -209,7 +243,7 @@ export default function PersonalAccessTokensTab({
     }
 
     try {
-      await deletePersonalAccessToken(token, id);
+      await deletePersonalAccessToken(authToken, id);
       await refreshPersonalAccessTokens();
     } catch (err: any) {
       console.error('Failed to delete:', err);
@@ -220,6 +254,12 @@ export default function PersonalAccessTokensTab({
     <div
       className={cn('flex-1 flex flex-col p-4 max-w-2xl mx-auto', className)}
     >
+      {newTokenValue ? (
+        <CopyTokenDialog
+          onClose={() => setNewTokenValue(null)}
+          token={newTokenValue}
+        />
+      ) : null}
       <div className="flex justify-between flex-row items-center">
         <div className="pt-1 pb-4">
           <div className="prose">
@@ -229,10 +269,8 @@ export default function PersonalAccessTokensTab({
             <p>
               Welcome to the Platform Beta! You can create{' '}
               <code>Personal Access Tokens</code> here. <br />
-              <a href="https://paper.dropbox.com/doc/Guide-Platform-Beta--CWdyjOhRfXmwljLmnSVTLTSBAg-YuqzAKxTHU7CMq5gJyD6S">
-                Take a look at this guide
-              </a>{' '}
-              to see how to use the platform API, and create apps on demand!
+              <a href="/labs/platform_demo">Take a look at this guide</a> to see
+              how to use the platform API, and create apps on demand!
             </p>
           </div>
         </div>
@@ -251,28 +289,21 @@ export default function PersonalAccessTokensTab({
             <tr>
               <th
                 className={cn(
-                  'z-10 cursor-pointer select-none whitespace-nowrap px-4 py-1'
+                  'z-10 cursor-pointer select-none whitespace-nowrap px-4 py-1',
                 )}
               >
                 Name
               </th>
               <th
                 className={cn(
-                  'w-full z-10 cursor-pointer select-none whitespace-nowrap px-4 py-1'
-                )}
-              >
-                Token
-              </th>
-              <th
-                className={cn(
-                  'z-10 cursor-pointer select-none whitespace-nowrap px-4 py-1 text-right'
+                  'z-10 cursor-pointer select-none whitespace-nowrap px-4 py-1',
                 )}
               >
                 Created
               </th>
               <th
                 className={cn(
-                  'z-10 cursor-pointer select-none whitespace-nowrap px-4 py-1'
+                  'z-10 cursor-pointer select-none whitespace-nowrap px-4 py-1',
                 )}
               ></th>
             </tr>
@@ -281,21 +312,11 @@ export default function PersonalAccessTokensTab({
             {personalAccessTokens.map(({ id, name, created_at }) => (
               <tr key={id} className="group border-b bg-white">
                 <td className="whitespace-nowrap px-4 py-1">{name}</td>
-                <td className="w-full whitespace-nowrap px-4 py-1">
-                  <CopyText
-                    label={id
-                      .slice(0, 4)
-                      .concat('************************')
-                      .concat(id.slice(-4))}
-                    value={id}
-                  />
-                </td>
-                <td className="whitespace-nowrap px-4 py-1 text-right">
+                <td className="whitespace-nowrap px-4 py-1">
                   {format(new Date(created_at), 'MMM dd, h:mma')}
                 </td>
                 <td className="px-4 py-1" style={{}}>
                   <div className="flex items-center gap-1">
-                    <CopyButton value={id} />
                     <Button
                       variant="destructive"
                       size="mini"

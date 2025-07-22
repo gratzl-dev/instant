@@ -1,24 +1,37 @@
 import { id, tx } from '@instantdb/core';
 import { InstantReactWebDatabase } from '@instantdb/react';
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { isObject } from 'lodash';
-import produce from 'immer';
-import Fuse from 'fuse.js';
+import { isObject, debounce, last } from 'lodash';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useContext,
+} from 'react';
+import { jsonFetch } from '@/lib/fetch';
+import config from '@/lib/config';
 import clsx from 'clsx';
 import CopyToClipboard from 'react-copy-to-clipboard';
+import {
+  Combobox,
+  ComboboxInput,
+  ComboboxOption,
+  ComboboxOptions,
+} from '@headlessui/react';
 
 import * as Tooltip from '@radix-ui/react-tooltip';
 import {
   ArrowLeftIcon,
   ArrowRightIcon,
   ChevronLeftIcon,
-  MenuIcon,
+  Bars3Icon,
   PlusIcon,
-  XIcon,
-} from '@heroicons/react/solid';
-import { PencilAltIcon } from '@heroicons/react/outline';
+  XMarkIcon,
+} from '@heroicons/react/24/solid';
+import { PencilSquareIcon } from '@heroicons/react/24/outline';
 
-import { errorToast } from '@/lib/toast';
+import { successToast, errorToast } from '@/lib/toast';
 import {
   ActionButton,
   ActionForm,
@@ -36,12 +49,374 @@ import {
 import { DBAttr, SchemaAttr, SchemaNamespace } from '@/lib/types';
 import { useIsOverflow } from '@/lib/hooks/useIsOverflow';
 import { useClickOutside } from '@/lib/hooks/useClickOutside';
-import { makeAttrComparator } from '@/lib/makeAttrComparator';
 import { isTouchDevice } from '@/lib/config';
-import { useSchemaQuery, useNamespacesQuery } from '@/lib/hooks/explorer';
+import {
+  useSchemaQuery,
+  useNamespacesQuery,
+  SearchFilter,
+} from '@/lib/hooks/explorer';
+import { TokenContext } from '@/lib/contexts';
 import { EditNamespaceDialog } from '@/components/dash/explorer/EditNamespaceDialog';
 import { EditRowDialog } from '@/components/dash/explorer/EditRowDialog';
 import { useRouter } from 'next/router';
+import { formatBytes } from '@/lib/format';
+
+// Helper functions for handling search filters in URLs
+function filtersToQueryString(filters: SearchFilter[]): string | null {
+  if (!filters.length) return null;
+  return JSON.stringify(filters);
+}
+
+function parseFiltersFromQueryString(
+  queryString: string | null,
+): SearchFilter[] {
+  if (!queryString) return [];
+  try {
+    return JSON.parse(queryString);
+  } catch (e) {
+    console.error('Failed to parse filters from query string:', e);
+    return [];
+  }
+}
+
+const OPERATORS = [':', '>', '<'] as const;
+type ParsedQueryPart = {
+  field: string;
+  operator: (typeof OPERATORS)[number];
+  value: string;
+};
+function parseSearchQuery(s: string): ParsedQueryPart[] {
+  let fieldStart = 0;
+  let currentPart: ParsedQueryPart | undefined;
+  let valueStart;
+  const parts: ParsedQueryPart[] = [];
+  let i = -1;
+  for (const c of s) {
+    i++;
+
+    if (c === ' ' && !(OPERATORS as readonly string[]).includes(s[i + 1])) {
+      fieldStart = i + 1;
+      continue;
+    }
+    if ((OPERATORS as readonly string[]).includes(c)) {
+      if (currentPart && valueStart != null) {
+        currentPart.value = s.substring(valueStart, fieldStart).trim();
+        parts.push(currentPart);
+      }
+      currentPart = {
+        field: s.substring(fieldStart, i).trim(),
+        operator: c as (typeof OPERATORS)[number],
+        value: '',
+      };
+
+      valueStart = i + 1;
+      continue;
+    }
+  }
+  if (currentPart && valueStart != null) {
+    currentPart.value = s.substring(valueStart).trim();
+    // Might push twice here...
+    parts.push(currentPart);
+  }
+  return parts;
+}
+
+function opToInstaqlOp(op: ':' | '<' | '>'): '=' | '$gt' | '$lt' {
+  switch (op) {
+    case ':':
+      // Not really an instaql op, but we have special handling in
+      // explorer.tsx to turn `=` into {k: v}
+      return '=';
+    case '<':
+      return '$lt';
+    case '>':
+      return '$gt';
+    default:
+      throw new Error('what kind of op is this? ' + op);
+  }
+}
+
+function queryToFilters({
+  query,
+  attrsByName,
+  stringIndexed,
+}: {
+  query: string;
+  attrsByName: { [key: string]: SchemaAttr };
+  stringIndexed: SchemaAttr[];
+}): SearchFilter[] {
+  if (!query.trim()) {
+    return [];
+  }
+  const parsed = parseSearchQuery(query);
+  const parts: SearchFilter[] = parsed.flatMap(
+    (part: ParsedQueryPart): SearchFilter[] => {
+      const attr = attrsByName[part.field];
+      if (!attr || !part.value) {
+        return [];
+      }
+      if (
+        part.value.toLowerCase() === 'null' &&
+        part.operator === ':' &&
+        !attr.isRequired
+      ) {
+        return [[part.field, '$isNull', null]];
+      }
+
+      const res: SearchFilter[] = [];
+      if (attr.checkedDataType && attr.isIndex) {
+        if (attr.checkedDataType === 'string') {
+          const val = part.value;
+          return [
+            [
+              part.field,
+              val === val.toLowerCase() ? '$ilike' : '$like',
+              `%${part.value}%`,
+            ],
+          ];
+        }
+        if (attr.checkedDataType === 'number') {
+          try {
+            return [
+              [
+                part.field,
+                opToInstaqlOp(part.operator),
+                JSON.parse(part.value),
+              ],
+            ];
+          } catch (e) {}
+        }
+        if (attr.checkedDataType === 'date') {
+          try {
+            return [
+              [
+                part.field,
+                opToInstaqlOp(part.operator),
+                JSON.parse(part.value),
+              ],
+            ];
+          } catch (e) {
+            // Might be a string date
+            return [[part.field, opToInstaqlOp(part.operator), part.value]];
+          }
+        }
+      }
+      for (const inferredType of attr.inferredTypes || ['json']) {
+        switch (inferredType) {
+          case 'boolean':
+          case 'number': {
+            try {
+              res.push([
+                part.field,
+                opToInstaqlOp(part.operator),
+                JSON.parse(part.value),
+              ]);
+            } catch (e) {}
+            break;
+          }
+          default: {
+            res.push([part.field, opToInstaqlOp(part.operator), part.value]);
+            break;
+          }
+        }
+      }
+      return res;
+    },
+  );
+
+  if (!parsed.length && query.trim() && stringIndexed.length) {
+    for (const a of stringIndexed) {
+      parts.push([
+        a.name,
+        query.toLowerCase() === query ? '$ilike' : '$like',
+        `%${query.trim()}%`,
+      ]);
+    }
+  }
+  return parts;
+}
+
+function sameFilters(
+  oldFilters: [string, string, string][],
+  newFilters: [string, string, string][],
+): boolean {
+  if (newFilters.length === oldFilters.length) {
+    for (let i = 0; i < newFilters.length; i++) {
+      for (let j = 0; j < 3; j++) {
+        if (newFilters[i][j] !== oldFilters[i][j]) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+const excludedSearchAttrs: [string, string][] = [
+  // Exclude computed fields
+  ['$files', 'url'],
+];
+
+function SearchInput({
+  onSearchChange,
+  attrs,
+  initialFilters = [],
+}: {
+  onSearchChange: (filters: SearchFilter[]) => void;
+  attrs?: SchemaAttr[];
+  initialFilters?: SearchFilter[];
+}) {
+  const [query, setQuery] = useState('');
+  const lastFilters = useRef<SearchFilter[]>(initialFilters);
+
+  const { attrsByName, stringIndexed } = useMemo(() => {
+    const byName: { [key: string]: SchemaAttr } = {};
+    const stringIndexed = [];
+    for (const attr of attrs || []) {
+      byName[attr.name] = attr;
+      if (attr.isIndex && attr.checkedDataType === 'string') {
+        stringIndexed.push(attr);
+      }
+    }
+    return { attrsByName: byName, stringIndexed };
+  }, [attrs]);
+
+  const searchDebounce = useCallback(
+    debounce((query) => {
+      const filters = queryToFilters({ query, attrsByName, stringIndexed });
+      if (!sameFilters(lastFilters.current, filters)) {
+        lastFilters.current = filters;
+        onSearchChange(filters);
+      }
+    }, 80),
+    [attrsByName, stringIndexed, lastFilters],
+  );
+
+  const lastQuerySegment =
+    query.indexOf(':') !== -1 ? last(query.split(' ')) : query;
+
+  const comboOptions: { field: string; operator: string; display: string }[] = (
+    attrs || []
+  ).flatMap((a) => {
+    const isExcluded = excludedSearchAttrs.some(
+      ([ns, name]) => ns === a.namespace && name === a.name,
+    );
+    if (a.type === 'ref' || isExcluded) {
+      return [];
+    }
+
+    const ops = [];
+
+    const opCandidates = [];
+    opCandidates.push({
+      field: a.name,
+      operator: ':',
+      display: `${a.name}:`,
+    });
+    if (
+      a.isIndex &&
+      (a.checkedDataType === 'number' || a.checkedDataType === 'date')
+    ) {
+      const base = {
+        field: a.name,
+        query: null,
+      };
+      opCandidates.push({ ...base, operator: '<', display: `${a.name}<` });
+      opCandidates.push({ ...base, operator: '>', display: `${a.name}>` });
+    }
+
+    for (const op of opCandidates) {
+      if (
+        !lastQuerySegment ||
+        (op.display.startsWith(lastQuerySegment) &&
+          op.display !== lastQuerySegment)
+      ) {
+        ops.push(op);
+      }
+    }
+    return ops;
+  });
+
+  const activeOption = useRef<(typeof comboOptions)[0] | null>(null);
+
+  function completeQuery(optionDisplay: string) {
+    let q;
+    if (lastQuerySegment && optionDisplay.startsWith(lastQuerySegment)) {
+      q = `${query}${optionDisplay.substring(lastQuerySegment.length)}`;
+    } else {
+      q = `${query.trim()} ${optionDisplay}`;
+    }
+    setQuery(q);
+    searchDebounce(q);
+  }
+
+  // Set initial search query based on filters
+  useEffect(() => {
+    if (initialFilters.length > 0 && !query) {
+      // Simple conversion - this could be improved
+      setQuery(initialFilters.map((f) => `${f[0]}:${f[2]}`).join(' '));
+    }
+  }, [initialFilters]);
+
+  return (
+    <Combobox
+      value={query}
+      onChange={(option) => {
+        if (option) {
+          completeQuery(option);
+        }
+      }}
+      immediate={true}
+    >
+      <ComboboxInput
+        size={32}
+        className="border border-gray-300 rounded-md px-3 py-2 text-sm"
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          searchDebounce(e.target.value);
+        }}
+        onKeyDown={(e) => {
+          // Prevent the combobox's default action that inserts
+          // the active option and tabs out of the input.
+          // Inserting the option doesn't work in our case, because
+          // it's just the start of a query, you still need to add
+          // the value
+          if (e.key === 'Tab' && comboOptions.length) {
+            e.preventDefault();
+
+            const active = activeOption.current || comboOptions[0];
+            if (active) {
+              completeQuery(active.display);
+            }
+          }
+        }}
+        placeholder="Filter..."
+      />
+      <ComboboxOptions
+        anchor="bottom start"
+        modal={false}
+        className="mt-1 w-[var(--input-width)] overflow-auto rounded-md bg-white shadow-lg z-10 border border-gray-300 divide-y"
+      >
+        {comboOptions.map((o, i) => (
+          <ComboboxOption
+            key={i}
+            value={o.display}
+            className={clsx('px-3 py-1 data-[focus]:bg-blue-100', {})}
+          >
+            {({ focus }) => {
+              if (focus) {
+                activeOption.current = o;
+              }
+              return <span>{o.display}</span>;
+            }}
+          </ComboboxOption>
+        ))}
+      </ComboboxOptions>
+    </Combobox>
+  );
+}
 
 export function Explorer({
   db,
@@ -62,11 +437,22 @@ export function Explorer({
   const [editableRowId, setEditableRowId] = useState<string | null>(null);
   const [addItemDialogOpen, setAddItemDialogOpen] = useState(false);
   const nsRef = useRef<HTMLDivElement>(null);
+  const lastSelectedIdRef = useRef<string | null>(null);
+
+  const [searchFilters, setSearchFilters] = useState<SearchFilter[]>([]);
+  const [ignoreUrlChanges, setIgnoreUrlChanges] = useState(false);
 
   // nav
   const router = useRouter();
   const selectedNamespaceId = router.query.ns as string;
+  const urlSearch = router.query.search as string;
+  const urlWhere = router.query.where
+    ? JSON.parse(router.query.where as string)
+    : null;
+  const urlLimit = parseInt(router.query.limit as string, 10) || 50;
+  const urlPage = parseInt(router.query.page as string, 10) || 1;
 
+  const [isNavigating, setIsNavigating] = useState(false);
   const [
     navStack,
     // don't call this directly, instead call `nav`
@@ -75,34 +461,108 @@ export function Explorer({
   const [checkedIds, setCheckedIds] = useState<Record<string, true>>({});
   const currentNav: ExplorerNav | undefined = navStack[navStack.length - 1];
   const showBackButton = navStack.length > 1;
-  function nav(s: ExplorerNav[]) {
+
+  function nav(s: ExplorerNav[], options?: { replaceHistory?: boolean }) {
+    setIsNavigating(true);
     _setNavStack(s);
     setCheckedIds({});
 
     const current = s[s.length - 1];
     const ns = current.namespace;
-    router.replace(
+
+    // Build query params including both namespace and search filters
+    const queryParams: any = {
+      ...router.query,
+      ns,
+    };
+
+    // Add where clause
+    if (current.where) {
+      queryParams.where = JSON.stringify(current.where);
+    } else {
+      delete queryParams.where;
+    }
+
+    // Add search filters
+    if (current.filters && current.filters.length > 0) {
+      queryParams.search = filtersToQueryString(current.filters);
+    } else {
+      delete queryParams.search;
+    }
+
+    // Add sort
+    if (current.sortAttr) {
+      queryParams.sort = current.sortAttr;
+      queryParams.sortDir = current.sortAsc ? 'asc' : 'desc';
+    } else {
+      delete queryParams.sort;
+      delete queryParams.sortDir;
+    }
+
+    // Add pagination
+    if (current.limit) {
+      queryParams.limit = current.limit;
+    } else {
+      delete queryParams.limit;
+    }
+    if (current.page) {
+      queryParams.page = current.page;
+    } else {
+      delete queryParams.page;
+    }
+
+    // Set flag to ignore the next URL change since we're causing it
+    setIgnoreUrlChanges(true);
+
+    const navMethod = options?.replaceHistory ? router.replace : router.push;
+
+    navMethod(
       {
-        query: { ...router.query, ns },
+        query: queryParams,
       },
       undefined,
       {
-        shallow: true,
+        // Don't scroll to top when navigating
+        scroll: false,
       },
-    );
+    ).then(() => {
+      setTimeout(() => {
+        setIsNavigating(false);
+      }, 50);
+    });
   }
+
   function replaceNavStackTop(_nav: Partial<ExplorerNav>) {
     const top = navStack[navStack.length - 1];
 
     if (!top) return;
 
-    nav([...navStack.slice(0, -1), { ...top, ..._nav }]);
+    nav([...navStack.slice(0, -1), { ...top, ..._nav }], {
+      replaceHistory: true,
+    });
   }
+
   function pushNavStack(_nav: ExplorerNav) {
+    const currentNamespace = navStack[navStack.length - 1]?.namespace;
+    if (currentNamespace !== _nav.namespace) {
+      // Reset search filters, offsets, and limit when changing namespaces
+      setSearchFilters([]);
+      setOffsets((prev) => ({
+        ...prev,
+        [_nav.namespace || '']: 0,
+      }));
+      setLimit(50);
+    }
+
     nav([...navStack, _nav]);
   }
+
   function popNavStack() {
-    nav(navStack.slice(0, -1));
+    // If we're just going back to the previous state in the nav stack,
+    // use browser history instead of pushing a new state
+    if (navStack.length > 1) {
+      router.back();
+    }
   }
 
   // data
@@ -116,78 +576,163 @@ export function Explorer({
     [namespaces, currentNav?.namespace],
   );
 
-  const isSystemCatalogNs =
-    selectedNamespace != null &&
-    selectedNamespace.name != null &&
-    selectedNamespace.name.startsWith('$');
+  // Handle searchFilters changes to update the URL and navigation state
+  useEffect(() => {
+    if (currentNav && searchFilters.length > 0 && !ignoreUrlChanges) {
+      replaceNavStackTop({ filters: searchFilters });
+    } else if (
+      searchFilters.length === 0 &&
+      currentNav?.filters?.length &&
+      !ignoreUrlChanges
+    ) {
+      replaceNavStackTop({ filters: [] });
+    }
+  }, [searchFilters]);
 
-  const readOnlyNs = isSystemCatalogNs && selectedNamespace.name !== '$users';
+  // Handle browser navigation (back/forward buttons)
+  useEffect(() => {
+    if (ignoreUrlChanges) {
+      // Reset the flag after the URL has changed
+      setIgnoreUrlChanges(false);
+      return;
+    }
+
+    // If we're currently navigating, ignore this effect
+    if (isNavigating) {
+      return;
+    }
+
+    if (namespaces && selectedNamespaceId && navStack.length > 0) {
+      // If the URL namespace doesn't match the current nav stack namespace
+      // or the search params have changed, update the nav stack
+      const currentNav = navStack[navStack.length - 1];
+
+      const changedNamespace = currentNav.namespace !== selectedNamespaceId;
+      const parsedSearch =
+        !changedNamespace && urlSearch
+          ? parseFiltersFromQueryString(urlSearch)
+          : [];
+      const sortAttr = router.query.sort as string;
+      const sortAsc = router.query.sortDir !== 'desc';
+
+      const needsUpdate =
+        changedNamespace ||
+        JSON.stringify(currentNav.where || null) !==
+          JSON.stringify(urlWhere || null) ||
+        JSON.stringify(currentNav.filters || []) !==
+          JSON.stringify(parsedSearch) ||
+        currentNav.sortAttr !== sortAttr ||
+        currentNav.sortAsc !== sortAsc;
+
+      if (needsUpdate) {
+        // Find the namespace in our list
+        const targetNamespace = namespaces.find(
+          (ns) => ns.id === selectedNamespaceId,
+        );
+        if (targetNamespace) {
+          // Update the nav stack without triggering another router push
+          _setNavStack([
+            {
+              namespace: selectedNamespaceId,
+              where: urlWhere,
+              filters: parsedSearch,
+              sortAttr,
+              sortAsc,
+            },
+          ]);
+
+          // Also update the search filters state
+          setSearchFilters(parsedSearch);
+
+          // Reset checked items
+          setCheckedIds({});
+        }
+      }
+    }
+  }, [
+    selectedNamespaceId,
+    urlWhere,
+    urlSearch,
+    router.query.sort,
+    router.query.sortDir,
+    namespaces,
+  ]);
+
+  // auth
+  const token = useContext(TokenContext);
+
+  const isSystemCatalogNs = selectedNamespace?.name?.startsWith('$') ?? false;
+  const sanitizedNsName = selectedNamespace?.name ?? '';
+  const readOnlyNs =
+    isSystemCatalogNs && !['$users', '$files'].includes(sanitizedNsName);
 
   const [limit, setLimit] = useState(50);
   const [offsets, setOffsets] = useState<{ [namespace: string]: number }>({});
 
-  const offset = offsets[selectedNamespace?.name ?? ''] || 0;
+  const offset = offsets[sanitizedNsName] || 0;
+
+  const sortAttr = currentNav?.sortAttr || 'serverCreatedAt';
+  const sortAsc = currentNav?.sortAsc ?? true;
 
   const { itemsRes, allCount } = useNamespacesQuery(
     db,
     selectedNamespace,
     currentNav?.where,
+    currentNav?.filters || searchFilters,
     limit,
     offset,
+    sortAttr,
+    sortAsc,
   );
 
-  const { allItems, fuse } = useMemo(() => {
-    const allItems: Record<string, any>[] =
-      itemsRes.data?.[selectedNamespace?.name ?? '']?.slice() ?? [];
-
-    const fuse = new Fuse(allItems, {
-      threshold: 0.15,
-      shouldSort: false,
-      keys:
-        selectedNamespace?.attrs.map((a) =>
-          a.type === 'ref' ? `${a.name}.id` : a.name,
-        ) ?? [],
-    });
-
-    return { allItems, fuse };
-  }, [itemsRes.data, selectedNamespace]);
-
-  const filteredSortedItems = useMemo(() => {
-    const _items = currentNav?.search
-      ? fuse.search(currentNav.search).map((r) => r.item)
-      : [...allItems];
-
-    const { sortAttr, sortAsc } = currentNav ?? {};
-
-    if (sortAttr) {
-      _items.sort(makeAttrComparator(sortAttr, sortAsc));
-    }
-
-    return _items;
-  }, [
-    allItems,
-    fuse,
-    currentNav?.search,
-    currentNav?.sortAsc,
-    currentNav?.sortAttr,
-  ]);
+  const allItems = itemsRes.data?.[selectedNamespace?.name ?? ''] ?? [];
 
   const numPages = allCount ? Math.ceil(allCount / limit) : 1;
   const currentPage = offset / limit + 1;
 
-  useEffect(() => {
-    const isFirstLoad = namespaces?.length && !navStack.length;
-    const urlWhere = router.query.where
-      ? JSON.parse(router.query.where as string)
-      : null;
+  const userNamespaces = namespaces?.filter((x) => !x.name.startsWith('$'));
 
-    if (isFirstLoad) {
-      nav([
+  // Handle initial load
+  useEffect(() => {
+    if (namespaces?.length && !navStack.length) {
+      const userNamespaces = namespaces?.filter((x) => !x.name.startsWith('$'));
+
+      // Parse search filters from URL if present
+      const parsedSearch = urlSearch
+        ? parseFiltersFromQueryString(urlSearch)
+        : [];
+
+      // Parse sort parameters
+      const sortAttr = (router.query.sort as string) || 'serverCreatedAt';
+      const sortAsc = router.query.sortDir !== 'desc';
+
+      const namespace = selectedNamespaceId || userNamespaces?.[0]?.id;
+
+      // Use _setNavStack directly to avoid triggering a router.push during initialization
+      _setNavStack([
         {
-          namespace: selectedNamespaceId || namespaces[0].id,
+          namespace,
           where: urlWhere,
+          filters: parsedSearch,
+          sortAttr,
+          sortAsc,
         },
       ]);
+
+      // Sync search, limits, and offsets with URL parameters
+      setSearchFilters(parsedSearch);
+      setLimit(urlLimit);
+      setOffsets((prev) => ({
+        ...prev,
+        [namespace || '']: (urlPage - 1) * urlLimit,
+      }));
+
+      // Add namespace to URL if not already present
+      if (!selectedNamespaceId) {
+        const queryParams = { ...router.query, ns: namespace };
+        // Replace URL without adding to history
+        router.replace({ query: queryParams }, undefined, { shallow: true });
+      }
     }
   }, [namespaces === null]);
 
@@ -199,7 +744,69 @@ export function Explorer({
     () => allItems.find((i) => i.id === editableRowId),
     [allItems.length, editableRowId],
   );
-  const rowText = Object.keys(checkedIds).length === 1 ? 'row' : 'rows';
+  const rowText =
+    sanitizedNsName === '$files'
+      ? Object.keys(checkedIds).length === 1
+        ? 'file'
+        : 'files'
+      : Object.keys(checkedIds).length === 1
+        ? 'row'
+        : 'rows';
+
+  // Storage
+
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [uploadingFile, setUploadingFile] = useState(false);
+  const [customPath, setCustomPath] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const handleUploadFile = async () => {
+    try {
+      setUploadingFile(true);
+      if (selectedFiles.length === 0) {
+        return;
+      }
+
+      const [file] = selectedFiles;
+      const success = await upload(token, appId, file, customPath);
+
+      if (success) {
+        setSelectedFiles([]);
+        setCustomPath('');
+        fileInputRef.current && (fileInputRef.current.value = '');
+      }
+
+      // await refreshFiles();
+      successToast('Successfully uploaded!');
+    } catch (err: any) {
+      console.error('Failed to upload:', err);
+      errorToast(`Failed to upload: ${err.body.message}`);
+    } finally {
+      setUploadingFile(false);
+    }
+  };
+
+  const handleRangeSelection = (currentId: string, checked: boolean) => {
+    const allItemIds = allItems.map((i) => i.id as string);
+    const currentIndex = allItemIds.indexOf(currentId);
+    const lastSelectedIndex = allItemIds.indexOf(lastSelectedIdRef.current!);
+    const [start, end] = [
+      Math.min(currentIndex, lastSelectedIndex),
+      Math.max(currentIndex, lastSelectedIndex),
+    ];
+
+    setCheckedIds((prev) => {
+      const newCheckedIds = { ...prev };
+      for (let i = start; i <= end; i++) {
+        const id = allItemIds[i];
+        if (checked) {
+          newCheckedIds[id] = true;
+        } else {
+          delete newCheckedIds[id];
+        }
+      }
+      return newCheckedIds;
+    });
+  };
 
   return (
     <div className="relative flex w-full flex-1 overflow-hidden">
@@ -229,13 +836,23 @@ export function Explorer({
               }
               onClick={async () => {
                 try {
-                  await db.transact(
-                    Object.keys(checkedIds).map((id) =>
-                      tx[selectedNamespace.name][id].delete(),
-                    ),
+                  if (selectedNamespace.name === '$files') {
+                    const filenames = allItems
+                      .filter((i) => i.id in checkedIds)
+                      .map((i) => i.path as string);
+                    await bulkDeleteFiles(token, appId, filenames);
+                  } else {
+                    await db.transact(
+                      Object.keys(checkedIds).map((id) =>
+                        tx[selectedNamespace.name][id].delete(),
+                      ),
+                    );
+                  }
+                } catch (error: any) {
+                  const errorMessage = error.message;
+                  errorToast(
+                    `Failed to delete ${rowText}${errorMessage ? `: ${errorMessage}` : ''}`,
                   );
-                } catch (error) {
-                  errorToast(`Failed to delete ${rowText}`);
                   return;
                 }
 
@@ -363,14 +980,14 @@ export function Explorer({
             setIsNsOpen(true);
           }}
         >
-          <MenuIcon height="1rem" />
+          <Bars3Icon height="1rem" />
         </button>
       </div>
       {selectedNamespace && currentNav && allItems ? (
         <div className="flex flex-1 flex-col overflow-hidden">
-          <div className="flex items-center border-b">
+          <div className="flex items-center border-b overflow-hidden">
             <div className="flex flex-1 flex-col justify-between md:flex-row md:items-center">
-              <div className="flex items-center border-b px-2 py-1 md:border-b-0">
+              <div className="flex items-center border-b px-2 py-1 md:border-b-0 overflow-hidden">
                 {showBackButton ? (
                   <ArrowLeftIcon
                     className="mr-4 inline cursor-pointer"
@@ -379,7 +996,7 @@ export function Explorer({
                   />
                 ) : null}
                 {currentNav?.where ? (
-                  <XIcon
+                  <XMarkIcon
                     className="mr-4 inline cursor-pointer"
                     height="1rem"
                     onClick={() => {
@@ -389,7 +1006,7 @@ export function Explorer({
                     }}
                   />
                 ) : null}
-                <div className="truncate whitespace-nowrap font-mono text-xs">
+                <div className="truncate overflow-hidden text-ellipses whitespace-nowrap font-mono text-xs flex-shrink">
                   <strong>{selectedNamespace.name}</strong>{' '}
                   {currentNav.where ? (
                     <>
@@ -399,6 +1016,25 @@ export function Explorer({
                         {JSON.stringify(currentNav.where[1])}
                       </em>
                     </>
+                  ) : null}
+                  {currentNav?.filters?.length ? (
+                    <span
+                      title={currentNav.filters
+                        .map(([attr, op, search]) => `${attr} ${op} ${search}`)
+                        .join(' || ')}
+                    >
+                      {currentNav.filters.map(([attr, op, search], i) => (
+                        <span key={attr}>
+                          <em className="rounded-sm border bg-white px-1">
+                            {attr} {op} {search}
+                          </em>
+                          {currentNav?.filters?.length &&
+                          i < currentNav.filters.length - 1
+                            ? ' || '
+                            : null}
+                        </span>
+                      ))}
+                    </span>
                   ) : null}
                 </div>
               </div>
@@ -412,39 +1048,84 @@ export function Explorer({
                 >
                   Edit Schema
                 </Button>
-                <TextInput
-                  className="text-content py-0 text-sm flex-1"
-                  placeholder="Filter..."
-                  value={currentNav?.search ?? ''}
-                  onChange={(v) => {
-                    replaceNavStackTop({
-                      search: v ?? undefined,
-                    });
-                  }}
+                <SearchInput
+                  key={selectedNamespaceId}
+                  onSearchChange={(filters) => setSearchFilters(filters)}
+                  attrs={selectedNamespace?.attrs}
+                  initialFilters={currentNav?.filters || []}
                 />
               </div>
             </div>
           </div>
+          {selectedNamespace.name === '$files' ? (
+            <div className="flex py-2 px-2 gap-2">
+              <div className="flex gap-2 w-full">
+                <div className="flex gap-2 flex-shrink-0">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    className="flex rounded-sm border border-zinc-200 bg-transparent px-1 py-1 text-sm shadow-sm transition-colors file:text-sm placeholder:text-zinc-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-zinc-950 disabled:cursor-not-allowed disabled:opacity-50"
+                    onChange={(e: React.ChangeEvent<any>) => {
+                      const files = e.target.files;
+                      setSelectedFiles(files);
+                      if (files?.[0]) {
+                        setCustomPath(files[0].name);
+                      }
+                    }}
+                  />
+                  <Button
+                    variant="primary"
+                    disabled={selectedFiles.length === 0}
+                    size="mini"
+                    loading={uploadingFile}
+                    onClick={handleUploadFile}
+                  >
+                    {uploadingFile ? 'Uploading...' : 'Upload file'}
+                  </Button>
+                </div>
+                <div className="relative flex flex-1 max-w-[67vw] min-w-0">
+                  <span className="absolute inset-y-0 left-0 flex items-center px-3 text-sm text-zinc-500 bg-gray-100 rounded-l-md ">
+                    File Path:
+                  </span>
+                  <input
+                    type="text"
+                    placeholder="Enter a custom path (optional)"
+                    value={customPath}
+                    onChange={(e) => setCustomPath(e.target.value)}
+                    className="w-full h-9 rounded-md bg-transparent pl-24 pr-3 py-1 text-sm placeholder:text-zinc-500 outline outline-1 outline-zinc-200 focus:ring-2 focus:ring-blue-700 border-0"
+                  />
+                </div>
+              </div>
+            </div>
+          ) : null}
           <div className="flex items-center justify-start space-x-2 p-1 text-xs border-b">
-            <Button
-              disabled={readOnlyNs}
-              title={
-                readOnlyNs
-                  ? `The ${selectedNamespace?.name} namespace is read-only.`
-                  : undefined
-              }
-              size="mini"
-              variant="secondary"
-              onClick={() => {
-                setAddItemDialogOpen(true);
-              }}
-            >
-              Add row
-            </Button>
+            {selectedNamespace.name !== '$files' ? (
+              <Button
+                disabled={readOnlyNs}
+                title={
+                  readOnlyNs
+                    ? `The ${selectedNamespace?.name} namespace is read-only.`
+                    : undefined
+                }
+                size="mini"
+                variant="secondary"
+                onClick={() => {
+                  setAddItemDialogOpen(true);
+                }}
+              >
+                Add row
+              </Button>
+            ) : null}
             <div>
               <Select
                 className="text-xs"
-                onChange={(opt) => opt && setLimit(parseInt(opt.value, 10))}
+                onChange={(opt) => {
+                  if (!opt) return;
+
+                  const newLimit = parseInt(opt.value, 10);
+                  setLimit(newLimit);
+                  replaceNavStackTop({ limit: newLimit });
+                }}
                 value={`${limit}`}
                 options={[
                   { label: '25/page', value: '25' },
@@ -464,12 +1145,15 @@ export function Explorer({
             <button
               className="flex items-center justify-center"
               disabled={currentPage <= 1}
-              onClick={() =>
+              onClick={() => {
                 setOffsets({
                   ...offsets,
                   [selectedNamespace.name]: Math.max(0, offset - limit),
-                })
-              }
+                });
+                replaceNavStackTop({
+                  page: Math.max(1, currentPage - 1),
+                });
+              }}
             >
               <ArrowLeftIcon
                 className={clsx('inline', {
@@ -503,12 +1187,15 @@ export function Explorer({
                         ? 'bg-gray-200'
                         : 'hover:bg-gray-100',
                     )}
-                    onClick={() =>
+                    onClick={() => {
                       setOffsets({
                         ...offsets,
                         [selectedNamespace.name]: i * limit,
-                      })
-                    }
+                      });
+                      replaceNavStackTop({
+                        page,
+                      });
+                    }}
                     disabled={page === currentPage}
                   >
                     {page}
@@ -519,12 +1206,15 @@ export function Explorer({
             <button
               className="flex items-center justify-center"
               disabled={currentPage >= numPages}
-              onClick={() =>
+              onClick={() => {
                 setOffsets({
                   ...offsets,
                   [selectedNamespace.name]: offset + limit,
-                })
-              }
+                });
+                replaceNavStackTop({
+                  page: Math.min(numPages, currentPage + 1),
+                });
+              }}
             >
               <ArrowRightIcon
                 className={clsx('inline', {
@@ -535,50 +1225,58 @@ export function Explorer({
             </button>
           </div>
           <div className="relative flex flex-1 overflow-x-auto overflow-y-scroll">
-            <div
-              className={clsx(
-                'absolute top-0 right-0 left-[48px] z-30 flex items-center gap-1.5 overflow-hidden bg-white px-4 py-1.5',
-                {
-                  hidden: !Object.keys(checkedIds).length,
-                },
-              )}
-            >
-              <Button
-                disabled={readOnlyNs}
-                title={
-                  readOnlyNs
-                    ? `The ${selectedNamespace?.name} namespace is read-only.`
-                    : undefined
-                }
-                variant="destructive"
-                size="mini"
-                className="flex px-2 py-0 text-xs"
-                onClick={() => {
-                  setDeleteDataConfirmationOpen(true);
-                }}
-              >
-                Delete {rowText}
-              </Button>
-            </div>
             <table className="z-0 w-full flex-1 text-left font-mono text-xs text-gray-500">
               <thead className="sticky top-0 z-20 bg-white text-gray-700 shadow">
+                <tr>
+                  <th
+                    colSpan={selectedNamespace.attrs.length + 1}
+                    className={clsx(
+                      'absolute top-0 right-0 left-[48px] z-30 flex items-center gap-1.5 overflow-hidden bg-white px-4 py-2',
+                      {
+                        hidden: !Object.keys(checkedIds).length,
+                      },
+                    )}
+                  >
+                    <Button
+                      disabled={readOnlyNs}
+                      title={
+                        readOnlyNs
+                          ? `The ${selectedNamespace?.name} namespace is read-only.`
+                          : undefined
+                      }
+                      variant="destructive"
+                      size="mini"
+                      className="flex px-2 py-0 text-xs"
+                      onClick={() => {
+                        setDeleteDataConfirmationOpen(true);
+                      }}
+                    >
+                      Delete {rowText}
+                    </Button>
+                  </th>
+                </tr>
                 <tr>
                   <th className="px-2 py-2" style={{ width: '48px' }}>
                     <Checkbox
                       checked={
-                        filteredSortedItems.length > 0 &&
-                        Object.keys(checkedIds).length ===
-                          filteredSortedItems.length
+                        allItems.length > 0 &&
+                        Object.keys(checkedIds).length === allItems.length
                       }
                       onChange={(checked) => {
                         if (checked) {
                           setCheckedIds(
                             Object.fromEntries(
-                              filteredSortedItems.map((i) => [i.id, true]),
+                              allItems.map((i) => [i.id, true]),
                             ),
                           );
+                          // Use the first item as the last selected ID
+                          if (allItems.length > 0) {
+                            lastSelectedIdRef.current = allItems[0]
+                              .id as string;
+                          }
                         } else {
                           setCheckedIds({});
+                          lastSelectedIdRef.current = null;
                         }
                       }}
                     />
@@ -587,41 +1285,67 @@ export function Explorer({
                     <th
                       key={attr.name}
                       className={clsx(
-                        'z-10 cursor-pointer select-none whitespace-nowrap px-4 py-1',
+                        'z-10 select-none whitespace-nowrap px-4 py-1',
                         {
-                          'bg-gray-200': currentNav.sortAttr === attr.name,
+                          'bg-gray-200':
+                            // Only highlight if one of the columns was clicked,
+                            // not if we're just doing our default sort
+                            currentNav?.sortAttr &&
+                            (sortAttr === attr.name ||
+                              (sortAttr === 'serverCreatedAt' &&
+                                attr.name === 'id')),
+                          'cursor-pointer': attr.sortable || attr.name === 'id',
                         },
                       )}
-                      onClick={() => {
-                        replaceNavStackTop({
-                          sortAttr: attr.name,
-                          sortAsc:
-                            currentNav.sortAttr !== attr.name
-                              ? true
-                              : !currentNav.sortAsc,
-                        });
-                      }}
+                      onClick={
+                        attr.sortable
+                          ? () => {
+                              replaceNavStackTop({
+                                sortAttr: attr.name,
+                                sortAsc:
+                                  sortAttr !== attr.name ? true : !sortAsc,
+                              });
+                            }
+                          : attr.name === 'id'
+                            ? () => {
+                                replaceNavStackTop({
+                                  sortAttr: 'serverCreatedAt',
+                                  sortAsc:
+                                    sortAttr !== 'serverCreatedAt'
+                                      ? true
+                                      : !sortAsc,
+                                });
+                              }
+                            : undefined
+                      }
                     >
                       <div className="flex items-center gap-2">
-                        {attr.name}
-                        <span>
-                          {currentNav.sortAttr === attr.name ? (
-                            currentNav.sortAsc ? (
-                              '↓'
+                        {selectedNamespace.name === '$files' &&
+                        attr.name === 'url'
+                          ? ''
+                          : attr.name}
+                        {attr.sortable || attr.name === 'id' ? (
+                          <span>
+                            {sortAttr === attr.name ||
+                            (sortAttr === 'serverCreatedAt' &&
+                              attr.name === 'id') ? (
+                              sortAsc ? (
+                                '↑'
+                              ) : (
+                                '↓'
+                              )
                             ) : (
-                              '↑'
-                            )
-                          ) : (
-                            <span className="text-gray-400">↓</span>
-                          )}
-                        </span>
+                              <span className="text-gray-400">↓</span>
+                            )}
+                          </span>
+                        ) : null}
                       </div>
                     </th>
                   ))}
                 </tr>
               </thead>
               <tbody className="font-mono">
-                {filteredSortedItems.map((item) => (
+                {allItems.map((item) => (
                   <tr
                     key={item.id as string}
                     className="group border-b bg-white"
@@ -632,16 +1356,29 @@ export function Explorer({
                     >
                       <Checkbox
                         checked={checkedIds[item.id as string] ?? false}
-                        onChange={(checked) => {
-                          setCheckedIds(
-                            produce(checkedIds, (draft) => {
+                        onChange={(checked, e) => {
+                          const isShiftPressed = e.nativeEvent
+                            ? (e.nativeEvent as MouseEvent).shiftKey
+                            : false;
+
+                          if (isShiftPressed && lastSelectedIdRef.current) {
+                            handleRangeSelection(item.id as string, checked);
+                          } else {
+                            // Regular single click selection
+                            setCheckedIds((prev) => {
+                              const newCheckedIds = { ...prev };
                               if (checked) {
-                                draft[item.id as string] = true;
+                                newCheckedIds[item.id as string] = true;
                               } else {
-                                delete draft[item.id as string];
+                                delete newCheckedIds[item.id as string];
                               }
-                            }),
-                          );
+                              return newCheckedIds;
+                            });
+                          }
+
+                          // Updated last selected for proper range selection
+                          // in future operations
+                          lastSelectedIdRef.current = item.id as string;
                         }}
                       />
                       {readOnlyNs ? null : (
@@ -649,7 +1386,7 @@ export function Explorer({
                           className="opacity-0 group-hover:opacity-100 transition-opacity"
                           onClick={() => setEditableRowId(item.id)}
                         >
-                          <PencilAltIcon className="h-4 w-4 text-gray-500" />
+                          <PencilSquareIcon className="h-4 w-4 text-gray-500" />
                         </button>
                       )}
                     </td>
@@ -664,22 +1401,35 @@ export function Explorer({
                               : '80px',
                         }}
                       >
-                        <ExplorerItemVal
-                          item={item}
-                          attr={attr}
-                          onClickLink={() => {
-                            const linkConfigDir =
-                              attr.linkConfig[
-                                !attr.isForward ? 'forward' : 'reverse'
-                              ];
-                            if (linkConfigDir) {
-                              pushNavStack({
-                                namespace: linkConfigDir.namespace,
-                                where: [`${linkConfigDir.attr}.id`, item.id],
-                              });
-                            }
-                          }}
-                        />
+                        {selectedNamespace.name === '$files' &&
+                        attr.name === 'url' ? (
+                          <Button
+                            variant="secondary"
+                            size="mini"
+                            onClick={() => {
+                              window.open(item.url as string, '_blank');
+                            }}
+                          >
+                            View File
+                          </Button>
+                        ) : (
+                          <ExplorerItemVal
+                            item={item}
+                            attr={attr}
+                            onClickLink={() => {
+                              const linkConfigDir =
+                                attr.linkConfig[
+                                  !attr.isForward ? 'forward' : 'reverse'
+                                ];
+                              if (linkConfigDir) {
+                                pushNavStack({
+                                  namespace: linkConfigDir.namespace,
+                                  where: [`${linkConfigDir.attr}.id`, item.id],
+                                });
+                              }
+                            }}
+                          />
+                        )}
                       </td>
                     ))}
                   </tr>
@@ -689,11 +1439,11 @@ export function Explorer({
             </table>
           </div>
         </div>
-      ) : namespaces?.length ? (
+      ) : userNamespaces?.length ? (
         <div className="px-4 py-2 text-sm italic text-gray-500">
           Select a namespace
         </div>
-      ) : namespaces?.length === 0 ? (
+      ) : userNamespaces?.length === 0 ? (
         <div className="flex flex-1 flex-col md:items-center md:justify-center">
           <div className="flex flex-1 flex-col gap-4 bg-gray-100 p-6 md:max-w-[320px] md:flex-none md:border">
             <SectionHeading>This is your Data Explorer</SectionHeading>
@@ -716,6 +1466,14 @@ export function Explorer({
   );
 }
 
+function getExplorerItemVal(item: Record<string, any>, attr: SchemaAttr) {
+  if (attr.namespace === '$files' && attr.name === 'size') {
+    return formatBytes(item.size);
+  }
+
+  return (item as any)[attr.name];
+}
+
 function ExplorerItemVal({
   item,
   attr,
@@ -725,7 +1483,7 @@ function ExplorerItemVal({
   attr: SchemaAttr;
   onClickLink: () => void;
 }) {
-  const val = (item as any)[attr.name];
+  const val = getExplorerItemVal(item, attr);
 
   const [tipOpen, setTipOpen] = useState(false);
   const [showCopy, setShowCopy] = useState(false);
@@ -879,7 +1637,9 @@ export interface ExplorerNav {
   where?: [string, any];
   sortAttr?: string;
   sortAsc?: boolean;
-  search?: string;
+  filters?: SearchFilter[];
+  limit?: number;
+  page?: number;
 }
 
 export type PushNavStack = (nav: ExplorerNav) => void;
@@ -897,4 +1657,51 @@ function _dev(db: InstantReactWebDatabase<any>) {
     };
     (window as any).i = i;
   }
+}
+
+// Storage
+
+async function upload(
+  token: string,
+  appId: string,
+  file: File,
+  customFilename: string,
+): Promise<boolean> {
+  const headers = {
+    app_id: appId,
+    path: customFilename || file.name,
+    authorization: `Bearer ${token}`,
+    'content-type': file.type,
+  };
+
+  const data = await jsonFetch(
+    `${config.apiURI}/dash/apps/${appId}/storage/upload`,
+    {
+      method: 'PUT',
+      headers,
+      body: file,
+    },
+  );
+
+  return data;
+}
+
+async function bulkDeleteFiles(
+  token: string,
+  appId: string,
+  filenames: string[],
+): Promise<any> {
+  const { data } = await jsonFetch(
+    `${config.apiURI}/dash/apps/${appId}/storage/files/delete`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ filenames }),
+    },
+  );
+
+  return data;
 }

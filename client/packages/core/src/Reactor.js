@@ -1,42 +1,52 @@
 // @ts-check
-import log from "./utils/log";
-import weakHash from "./utils/weakHash";
-import instaql from "./instaql";
-import * as instaml from "./instaml";
-import * as s from "./store";
-import uuid from "./utils/uuid";
-import IndexedDBStorage from "./IndexedDBStorage";
-import WindowNetworkListener from "./WindowNetworkListener";
-import * as authAPI from "./authAPI";
-import * as StorageApi from "./StorageAPI";
-import { buildPresenceSlice, hasPresenceResponseChanged } from "./presence";
-import { Deferred } from "./utils/Deferred";
-import { PersistedObject } from "./utils/PersistedObject";
-import { extractTriples } from "./model/instaqlResult";
-import { areObjectsDeepEqual } from "./utils/object";
-import { createLinkIndex } from "./utils/linkIndex";
-import version from "./version";
+import weakHash from './utils/weakHash.ts';
+import instaql from './instaql.js';
+import * as instaml from './instaml.js';
+import * as s from './store.js';
+import uuid from './utils/uuid.ts';
+import IndexedDBStorage from './IndexedDBStorage.js';
+import WindowNetworkListener from './WindowNetworkListener.js';
+import * as authAPI from './authAPI.ts';
+import * as StorageApi from './StorageAPI.ts';
+import * as flags from './utils/flags.ts';
+import { buildPresenceSlice, hasPresenceResponseChanged } from './presence.ts';
+import { Deferred } from './utils/Deferred.js';
+import { PersistedObject } from './utils/PersistedObject.js';
+import { extractTriples } from './model/instaqlResult.js';
+import {
+  areObjectsDeepEqual,
+  assocInMutative,
+  dissocInMutative,
+  insertInMutative,
+} from './utils/object.js';
+import { createLinkIndex } from './utils/linkIndex.ts';
+import version from './version.js';
+import { create } from 'mutative';
+import createLogger from './utils/log.ts';
+
+/** @typedef {import('./utils/log.ts').Logger} Logger */
 
 const STATUS = {
-  CONNECTING: "connecting",
-  OPENED: "opened",
-  AUTHENTICATED: "authenticated",
-  CLOSED: "closed",
-  ERRORED: "errored",
+  CONNECTING: 'connecting',
+  OPENED: 'opened',
+  AUTHENTICATED: 'authenticated',
+  CLOSED: 'closed',
+  ERRORED: 'errored',
 };
 
 const QUERY_ONCE_TIMEOUT = 30_000;
+const PENDING_TX_CLEANUP_TIMEOUT = 30_000;
 
 const WS_CONNECTING_STATUS = 0;
 const WS_OPEN_STATUS = 1;
 
 const defaultConfig = {
-  apiURI: "https://api.instantdb.com",
-  websocketURI: "wss://api.instantdb.com/runtime/session",
+  apiURI: 'https://api.instantdb.com',
+  websocketURI: 'wss://api.instantdb.com/runtime/session',
 };
 
 // Param that the backend adds if this is an oauth redirect
-const OAUTH_REDIRECT_PARAM = "_instant_oauth_redirect";
+const OAUTH_REDIRECT_PARAM = '_instant_oauth_redirect';
 
 const currentUserKey = `currentUser`;
 
@@ -49,18 +59,19 @@ function createWebSocket(uri) {
 }
 
 function isClient() {
-  const hasWindow = typeof window !== "undefined";
+  const hasWindow = typeof window !== 'undefined';
   // this checks if we are running in a chrome extension
   // @ts-expect-error
-  const isChrome = typeof chrome !== "undefined";
+  const isChrome = typeof chrome !== 'undefined';
 
   return hasWindow || isChrome;
 }
 
 const ignoreLogging = {
-  "set-presence": true,
-  "set-presence-ok": true,
-  "refresh-presence": true,
+  'set-presence': true,
+  'set-presence-ok': true,
+  'refresh-presence': true,
+  'patch-presence': true,
 };
 
 function querySubsFromJSON(str) {
@@ -90,8 +101,21 @@ function querySubsToJSON(querySubs) {
   return JSON.stringify(jsonSubs);
 }
 
+function sortedMutationEntries(entries) {
+  return [...entries].sort((a, b) => {
+    const [ka, muta] = a;
+    const [kb, mutb] = b;
+    const a_order = muta.order || 0;
+    const b_order = mutb.order || 0;
+    if (a_order == b_order) {
+      return ka < kb ? -1 : ka > kb ? 1 : 0;
+    }
+    return a_order - b_order;
+  });
+}
+
 /**
- * @template {import('./presence').RoomSchemaShape} [RoomSchema = {}]
+ * @template {import('./presence.ts').RoomSchemaShape} [RoomSchema = {}]
  */
 export default class Reactor {
   attrs;
@@ -123,7 +147,7 @@ export default class Reactor {
   /** @type {Promise<null | {error: {message: string}}>}**/
   _oauthCallbackResponse = null;
 
-  /** @type {null | import('./utils/linkIndex').LinkIndex}} */
+  /** @type {null | import('./utils/linkIndex.ts').LinkIndex}} */
   _linkIndex = null;
 
   /** @type BroadcastChannel | undefined */
@@ -139,6 +163,8 @@ export default class Reactor {
   _currentUserCached = { isLoading: true, error: undefined, user: undefined };
   _beforeUnloadCbs = [];
   _dataForQueryCache = {};
+  /** @type {Logger} */
+  _log;
 
   constructor(
     config,
@@ -147,7 +173,13 @@ export default class Reactor {
     versions,
   ) {
     this.config = { ...defaultConfig, ...config };
-    this.versions = { ...(versions || {}), "@instantdb/core": version };
+    this.queryCacheLimit = this.config.queryCacheLimit ?? 10;
+
+    this._log = createLogger(
+      config.verbose || flags.devBackend || flags.instantLogs,
+    );
+
+    this.versions = { ...(versions || {}), '@instantdb/core': version };
 
     if (this.config.schema) {
       this._linkIndex = createLinkIndex(this.config.schema);
@@ -158,12 +190,16 @@ export default class Reactor {
     if (!isClient()) {
       return;
     }
-    if (typeof BroadcastChannel === "function") {
-      this._broadcastChannel = new BroadcastChannel("@instantdb");
-      this._broadcastChannel.addEventListener("message", async (e) => {
-        if (e.data?.type === "auth") {
-          const res = await this.getCurrentUser();
-          this.updateUser(res.user);
+    if (typeof BroadcastChannel === 'function') {
+      this._broadcastChannel = new BroadcastChannel('@instantdb');
+      this._broadcastChannel.addEventListener('message', async (e) => {
+        try {
+          if (e.data?.type === 'auth') {
+            const res = await this.getCurrentUser();
+            this.updateUser(res.user);
+          }
+        } catch (e) {
+          this._log.error('[error] handle broadcast channel', e);
         }
       });
     }
@@ -185,25 +221,42 @@ export default class Reactor {
         if (isOnline === this._isOnline) {
           return;
         }
-        log.info("[network] online =", isOnline);
+        this._log.info('[network] online =', isOnline);
         this._isOnline = isOnline;
         if (this._isOnline) {
           this._startSocket();
+        } else {
+          this._log.info(
+            'Changing status from',
+            this.status,
+            'to',
+            STATUS.CLOSED,
+          );
+          this._setStatus(STATUS.CLOSED);
         }
       });
     });
 
-    if (typeof addEventListener !== "undefined") {
+    if (typeof addEventListener !== 'undefined') {
       this._beforeUnload = this._beforeUnload.bind(this);
-      addEventListener("beforeunload", this._beforeUnload);
+      addEventListener('beforeunload', this._beforeUnload);
     }
+  }
+
+  updateSchema(schema) {
+    this.config = {
+      ...this.config,
+      schema: schema,
+      cardinalityInference: Boolean(schema),
+    };
+    this._linkIndex = schema ? createLinkIndex(this.config.schema) : null;
   }
 
   _initStorage(Storage) {
     this._persister = new Storage(`instant_${this.config.appId}_5`);
     this.querySubs = new PersistedObject(
       this._persister,
-      "querySubs",
+      'querySubs',
       {},
       this._onMergeQuerySubs,
       querySubsToJSON,
@@ -211,7 +264,7 @@ export default class Reactor {
     );
     this.pendingMutations = new PersistedObject(
       this._persister,
-      "pendingMutations",
+      'pendingMutations',
       new Map(),
       this._onMergePendingMutations,
       (x) => {
@@ -235,25 +288,25 @@ export default class Reactor {
 
   /**
    * @param {'enqueued' | 'pending' | 'synced' | 'timeout' |  'error' } status
-   * @param string clientId
+   * @param string eventId
    * @param {{message?: string, hint?: string, error?: Error}} [errDetails]
    */
-  _finishTransaction(status, clientId, errDetails) {
-    const dfd = this.mutationDeferredStore.get(clientId);
-    this.mutationDeferredStore.delete(clientId);
-    const ok = status !== "error" && status !== "timeout";
+  _finishTransaction(status, eventId, errDetails) {
+    const dfd = this.mutationDeferredStore.get(eventId);
+    this.mutationDeferredStore.delete(eventId);
+    const ok = status !== 'error' && status !== 'timeout';
 
     if (!dfd && !ok) {
       // console.erroring here, as there are no listeners to let know
-      console.error("Mutation failed", { status, clientId, ...errDetails });
+      console.error('Mutation failed', { status, eventId, ...errDetails });
     }
     if (!dfd) {
       return;
     }
     if (ok) {
-      dfd.resolve({ status, clientId });
+      dfd.resolve({ status, eventId });
     } else {
-      dfd.reject({ status, clientId, ...errDetails });
+      dfd.reject({ status, eventId, ...errDetails });
     }
   }
 
@@ -294,7 +347,13 @@ export default class Reactor {
     // we can keep usage information about which queries are popular.
     const storageKsToAdd = Object.keys(storageSubs)
       .filter((k) => !inMemorySubs[k])
-      .slice(0, 10);
+      .sort((a, b) => {
+        // Sort by lastAccessed, newest first
+        const aTime = storageSubs[a]?.lastAccessed || 0;
+        const bTime = storageSubs[b]?.lastAccessed || 0;
+        return bTime - aTime;
+      })
+      .slice(0, this.queryCacheLimit);
 
     storageKsToAdd.forEach((k) => {
       ret[k] = storageSubs[k];
@@ -314,12 +373,12 @@ export default class Reactor {
     const ret = new Map([...storageMuts.entries(), ...inMemoryMuts.entries()]);
     this.pendingMutations.set((_) => ret);
     this.loadedNotifyAll();
-    const rewrittenStorageMuts = this._rewriteMutations(
+    const rewrittenStorageMuts = this._rewriteMutationsSorted(
       this.attrs,
       storageMuts,
     );
-    rewrittenStorageMuts.forEach((mut, k) => {
-      if (!inMemoryMuts.has(k) && !mut["tx-id"]) {
+    rewrittenStorageMuts.forEach(([k, mut]) => {
+      if (!inMemoryMuts.has(k) && !mut['tx-id']) {
         this._sendMutation(k, mut);
       }
     });
@@ -347,34 +406,35 @@ export default class Reactor {
     // opt-out, enabled by default if schema
     const enableCardinalityInference =
       Boolean(this.config.schema) &&
-      ("cardinalityInference" in this.config
+      ('cardinalityInference' in this.config
         ? Boolean(this.config.cardinalityInference)
         : true);
     if (!ignoreLogging[msg.op]) {
-      log.info("[receive]", wsId, msg.op, msg);
+      this._log.info('[receive]', wsId, msg.op, msg);
     }
     switch (msg.op) {
-      case "init-ok":
+      case 'init-ok':
         this._setStatus(STATUS.AUTHENTICATED);
         this._reconnectTimeoutMs = 0;
         this._setAttrs(msg.attrs);
         this._flushPendingMessages();
         // (EPH): set session-id, so we know
         // which item is us
-        this._sessionId = msg["session-id"];
+        this._sessionId = msg['session-id'];
 
         for (const roomId of Object.keys(this._rooms)) {
-          this._tryJoinRoom(roomId);
+          const enqueuedUserPresence = this._presence[roomId]?.result?.user;
+          this._tryJoinRoom(roomId, enqueuedUserPresence);
         }
         break;
-      case "add-query-exists":
+      case 'add-query-exists':
         this.notifyOneQueryOnce(weakHash(msg.q));
         break;
-      case "add-query-ok":
+      case 'add-query-ok':
         const { q, result } = msg;
         const hash = weakHash(q);
-        const pageInfo = result?.[0]?.data?.["page-info"];
-        const aggregate = result?.[0]?.data?.["aggregate"];
+        const pageInfo = result?.[0]?.data?.['page-info'];
+        const aggregate = result?.[0]?.data?.['aggregate'];
         const triples = extractTriples(result);
         const store = s.createStore(
           this.attrs,
@@ -383,18 +443,46 @@ export default class Reactor {
           this._linkIndex,
         );
         this.querySubs.set((prev) => {
-          prev[hash].result = { store, pageInfo, aggregate };
+          prev[hash].result = {
+            store,
+            pageInfo,
+            aggregate,
+            processedTxId: msg['processed-tx-id'],
+          };
           return prev;
         });
+        this._cleanupPendingMutationsQueries();
         this.notifyOne(hash);
         this.notifyOneQueryOnce(hash);
+        this._cleanupPendingMutationsTimeout();
         break;
-      case "refresh-ok":
+      case 'refresh-ok':
         const { computations, attrs } = msg;
-        this._setAttrs(attrs);
+        const processedTxId = msg['processed-tx-id'];
+        if (attrs) {
+          this._setAttrs(attrs);
+        }
+
+        this._cleanupPendingMutationsTimeout();
+
+        const rewrittenMutations = this._rewriteMutations(
+          this.attrs,
+          this.pendingMutations.currentValue,
+          processedTxId,
+        );
+
+        if (rewrittenMutations !== this.pendingMutations.currentValue) {
+          // We know we've changed the mutations to fix the attr ids and removed
+          // processed attrs, so we'll persist those changes to prevent optimisticAttrs
+          // from using old attr definitions
+          this.pendingMutations.set(() => rewrittenMutations);
+        }
+
+        const mutations = sortedMutationEntries(rewrittenMutations.entries());
+
         const updates = computations.map((x) => {
-          const q = x["instaql-query"];
-          const result = x["instaql-result"];
+          const q = x['instaql-query'];
+          const result = x['instaql-result'];
           const hash = weakHash(q);
           const triples = extractTriples(result);
           const store = s.createStore(
@@ -403,22 +491,33 @@ export default class Reactor {
             enableCardinalityInference,
             this._linkIndex,
           );
-          const pageInfo = result?.[0]?.data?.["page-info"];
-          const aggregate = result?.[0]?.data?.["aggregate"];
-          return { hash, store, pageInfo, aggregate };
+          const newStore = this._applyOptimisticUpdates(
+            store,
+            mutations,
+            processedTxId,
+          );
+
+          const pageInfo = result?.[0]?.data?.['page-info'];
+          const aggregate = result?.[0]?.data?.['aggregate'];
+          return { hash, store: newStore, pageInfo, aggregate };
         });
+
         updates.forEach(({ hash, store, pageInfo, aggregate }) => {
           this.querySubs.set((prev) => {
-            prev[hash].result = { store, pageInfo, aggregate };
+            prev[hash].result = { store, pageInfo, aggregate, processedTxId };
             return prev;
           });
         });
+
+        this._cleanupPendingMutationsQueries();
+
         updates.forEach(({ hash }) => {
           this.notifyOne(hash);
         });
         break;
-      case "transact-ok":
-        const { "client-event-id": eventId, "tx-id": txId } = msg;
+      case 'transact-ok':
+        const { 'client-event-id': eventId, 'tx-id': txId } = msg;
+
         const muts = this._rewriteMutations(
           this.attrs,
           this.pendingMutations.currentValue,
@@ -428,48 +527,46 @@ export default class Reactor {
           break;
         }
 
-        // Now that this transaction is accepted, 
-        // We can delete it from our queue. 
+        // update pendingMutation with server-side tx-id
         this.pendingMutations.set((prev) => {
-          prev.delete(eventId);
+          prev.set(eventId, {
+            ...prev.get(eventId),
+            'tx-id': txId,
+            confirmed: Date.now(),
+          });
           return prev;
         });
-        
-        // We apply this transaction to all our existing queries
-        const txStepsToApply = prevMutation["tx-steps"];
-        this.querySubs.set((prev) => {
-          for (const [hash, sub] of Object.entries(prev)) {
-            const store = sub?.result?.store;
-            if (!store) {
-              continue;
-            }
-            const newStore = s.transact(store, txStepsToApply);
-            prev[hash].result.store = newStore;
-          }
-          return prev;
-        })
 
-        const newAttrs = prevMutation["tx-steps"]
-          .filter(([action, ..._args]) => action === "add-attr")
+        this._cleanupPendingMutationsTimeout();
+
+        const newAttrs = prevMutation['tx-steps']
+          .filter(([action, ..._args]) => action === 'add-attr')
           .map(([_action, attr]) => attr)
           .concat(Object.values(this.attrs));
-        
+
         this._setAttrs(newAttrs);
-        
-        this._finishTransaction("synced", eventId);
+
+        this._finishTransaction('synced', eventId);
         break;
-      case "refresh-presence":
-        const roomId = msg["room-id"];
-        this._setPresencePeers(roomId, msg.data);
+      case 'patch-presence': {
+        const roomId = msg['room-id'];
+        this._patchPresencePeers(roomId, msg['edits']);
         this._notifyPresenceSubs(roomId);
         break;
-      case "server-broadcast":
-        const room = msg["room-id"];
+      }
+      case 'refresh-presence': {
+        const roomId = msg['room-id'];
+        this._setPresencePeers(roomId, msg['data']);
+        this._notifyPresenceSubs(roomId);
+        break;
+      }
+      case 'server-broadcast':
+        const room = msg['room-id'];
         const topic = msg.topic;
         this._notifyBroadcastSubs(room, topic, msg);
         break;
-      case "join-room-ok":
-        const loadingRoomId = msg["room-id"];
+      case 'join-room-ok':
+        const loadingRoomId = msg['room-id'];
         const joinedRoom = this._rooms[loadingRoomId];
 
         if (!joinedRoom) {
@@ -485,15 +582,15 @@ export default class Reactor {
         this._notifyPresenceSubs(loadingRoomId);
         this._flushEnqueuedRoomData(loadingRoomId);
         break;
-      case "join-room-error":
-        const errorRoomId = msg["room-id"];
+      case 'join-room-error':
+        const errorRoomId = msg['room-id'];
         const errorRoom = this._rooms[errorRoomId];
         if (errorRoom) {
-          errorRoom.error = msg["error"];
+          errorRoom.error = msg['error'];
         }
         this._notifyPresenceSubs(errorRoomId);
         break;
-      case "error":
+      case 'error':
         this._handleReceiveError(msg);
         break;
       default:
@@ -509,7 +606,7 @@ export default class Reactor {
   _handleMutationError(status, eventId, errDetails) {
     const mut = this.pendingMutations.currentValue.get(eventId);
 
-    if (mut && (status !== "timeout" || !mut["tx-id"])) {
+    if (mut && (status !== 'timeout' || !mut['tx-id'])) {
       this.pendingMutations.set((prev) => {
         prev.delete(eventId);
         return prev;
@@ -522,10 +619,10 @@ export default class Reactor {
   }
 
   _handleReceiveError(msg) {
-    const eventId = msg["client-event-id"];
+    const eventId = msg['client-event-id'];
     const prevMutation = this.pendingMutations.currentValue.get(eventId);
     const errorMessage = {
-      message: msg.message || "Uh-oh, something went wrong. Ping Joe & Stopa.",
+      message: msg.message || 'Uh-oh, something went wrong. Ping Joe & Stopa.',
     };
 
     if (msg.hint) {
@@ -538,23 +635,26 @@ export default class Reactor {
         message: msg.message,
         hint: msg.hint,
       };
-      this._handleMutationError("error", eventId, errDetails);
+      this._handleMutationError('error', eventId, errDetails);
       return;
     }
 
-    const q = msg["original-event"]?.q;
-    if (q && msg["original-event"]?.op === "add-query") {
+    if (
+      msg['original-event']?.hasOwnProperty('q') &&
+      msg['original-event']?.op === 'add-query'
+    ) {
+      const q = msg['original-event']?.q;
       const hash = weakHash(q);
       this.notifyQueryError(weakHash(q), errorMessage);
       this.notifyQueryOnceError(q, hash, eventId, errorMessage);
       return;
     }
 
-    const isInitError = msg["original-event"]?.op === "init";
+    const isInitError = msg['original-event']?.op === 'init';
     if (isInitError) {
       if (
-        msg.type === "record-not-found" &&
-        msg.hint?.["record-type"] === "app-user"
+        msg.type === 'record-not-found' &&
+        msg.hint?.['record-type'] === 'app-user'
       ) {
         // User has been logged out
         this.changeCurrentUser(null);
@@ -575,7 +675,7 @@ export default class Reactor {
     console.error(msg.message, errorObj);
     if (msg.hint) {
       console.error(
-        "This error comes with some debugging information. Here it is: \n",
+        'This error comes with some debugging information. Here it is: \n',
         msg.hint,
       );
     }
@@ -609,9 +709,10 @@ export default class Reactor {
     const eventId = uuid();
     this.querySubs.set((prev) => {
       prev[hash] = prev[hash] || { q, result: null, eventId };
+      prev[hash].lastAccessed = Date.now();
       return prev;
     });
-    this._trySendAuthed(eventId, { op: "add-query", q });
+    this._trySendAuthed(eventId, { op: 'add-query', q });
 
     return eventId;
   }
@@ -626,7 +727,11 @@ export default class Reactor {
    *
    *  Returns an unsubscribe function
    */
-  subscribeQuery(q, cb) {
+  subscribeQuery(q, cb, opts) {
+    if (opts && 'ruleParams' in opts) {
+      q = { $$ruleParams: opts['ruleParams'], ...q };
+    }
+
     const hash = weakHash(q);
 
     const prevResult = this.getPreviousResult(q);
@@ -644,7 +749,11 @@ export default class Reactor {
     };
   }
 
-  queryOnce(q) {
+  queryOnce(q, opts) {
+    if (opts && 'ruleParams' in opts) {
+      q = { $$ruleParams: opts['ruleParams'], ...q };
+    }
+
     const dfd = new Deferred();
 
     if (!this._isOnline) {
@@ -671,7 +780,7 @@ export default class Reactor {
     this.queryOnceDfds[hash].push({ q, dfd, eventId });
 
     setTimeout(
-      () => dfd.reject(new Error("Query timed out")),
+      () => dfd.reject(new Error('Query timed out')),
       QUERY_ONCE_TIMEOUT,
     );
 
@@ -705,7 +814,7 @@ export default class Reactor {
     delete this.queryCbs[hash];
     delete this.queryOnceDfds[hash];
 
-    this._trySendAuthed(uuid(), { op: "remove-query", q });
+    this._trySendAuthed(uuid(), { op: 'remove-query', q });
   }
 
   // When we `pushTx`, it's possible that we don't yet have `this.attrs`
@@ -719,20 +828,22 @@ export default class Reactor {
   // We remove `add-attr` commands for attrs that already exist.
   // We update `add-triple` and `retract-triple` commands to use the
   // server attr-ids.
-  _rewriteMutations(attrs, muts) {
+  _rewriteMutations(attrs, muts, processedTxId) {
     if (!attrs) return muts;
     const findExistingAttr = (attr) => {
-      const [_, etype, label] = attr["forward-identity"];
+      const [_, etype, label] = attr['forward-identity'];
       const existing = instaml.getAttrByFwdIdentName(attrs, etype, label);
       return existing;
     };
     const findReverseAttr = (attr) => {
-      const [_, etype, label] = attr["forward-identity"];
+      const [_, etype, label] = attr['forward-identity'];
       const revAttr = instaml.getAttrByReverseIdentName(attrs, etype, label);
       return revAttr;
     };
     const mapping = { attrIdMap: {}, refSwapAttrIds: new Set() };
-    const rewriteTxSteps = (txSteps) => {
+    let mappingChanged = false;
+
+    const rewriteTxSteps = (txSteps, txId) => {
       const retTxSteps = [];
       for (const txStep of txSteps) {
         const [action] = txStep;
@@ -740,36 +851,64 @@ export default class Reactor {
         // Handles add-attr
         // If existing, we drop it, and track it
         // to update add/retract triples
-        if (action === "add-attr") {
+        if (action === 'add-attr') {
           const [_action, attr] = txStep;
           const existing = findExistingAttr(attr);
-          if (existing) {
+          if (existing && attr.id !== existing.id) {
             mapping.attrIdMap[attr.id] = existing.id;
+            mappingChanged = true;
             continue;
           }
-          if (attr["value-type"] === "ref") {
+          if (attr['value-type'] === 'ref') {
             const revAttr = findReverseAttr(attr);
             if (revAttr) {
               mapping.attrIdMap[attr.id] = revAttr.id;
               mapping.refSwapAttrIds.add(attr.id);
+              mappingChanged = true;
               continue;
             }
           }
         }
 
+        if (
+          (processedTxId &&
+            txId &&
+            processedTxId >= txId &&
+            action === 'add-attr') ||
+          action === 'update-attr' ||
+          action === 'delete-attr'
+        ) {
+          mappingChanged = true;
+          // Don't add this step because we already have the newer attrs
+          continue;
+        }
         // Handles add-triple|retract-triple
         // If in mapping, we update the attr-id
-        const newTxStep = instaml.rewriteStep(mapping, txStep);
+        const newTxStep = mappingChanged
+          ? instaml.rewriteStep(mapping, txStep)
+          : txStep;
 
         retTxSteps.push(newTxStep);
       }
-      return retTxSteps;
+
+      return mappingChanged ? retTxSteps : txSteps;
     };
+
     const rewritten = new Map();
     for (const [k, mut] of muts.entries()) {
-      rewritten.set(k, { ...mut, "tx-steps": rewriteTxSteps(mut["tx-steps"]) });
+      rewritten.set(k, {
+        ...mut,
+        'tx-steps': rewriteTxSteps(mut['tx-steps'], mut['tx-id']),
+      });
+    }
+    if (!mappingChanged) {
+      return muts;
     }
     return rewritten;
+  }
+
+  _rewriteMutationsSorted(attrs, muts) {
+    return sortedMutationEntries(this._rewriteMutations(attrs, muts).entries());
   }
 
   // ---------------------------
@@ -779,20 +918,20 @@ export default class Reactor {
     const pendingMutationSteps = [
       ...this.pendingMutations.currentValue.values(),
     ] // hack due to Map()
-      .flatMap((x) => x["tx-steps"]);
+      .flatMap((x) => x['tx-steps']);
 
     const deletedAttrIds = new Set(
       pendingMutationSteps
-        .filter(([action, _attr]) => action === "delete-attr")
+        .filter(([action, _attr]) => action === 'delete-attr')
         .map(([_action, id]) => id),
     );
 
     const pendingAttrs = [];
     for (const [_action, attr] of pendingMutationSteps) {
-      if (_action === "add-attr") {
+      if (_action === 'add-attr') {
         pendingAttrs.push(attr);
       } else if (
-        _action === "update-attr" &&
+        _action === 'update-attr' &&
         attr.id &&
         this.attrs?.[attr.id]
       ) {
@@ -838,11 +977,16 @@ export default class Reactor {
       return cached.data;
     }
 
-    const { store, pageInfo, aggregate } = result;
-    const muts = this._rewriteMutations(store.attrs, pendingMutations);
-
-    const txSteps = [...muts.values()].flatMap((x) => x["tx-steps"]);
-    const newStore = s.transact(store, txSteps);
+    const { store, pageInfo, aggregate, processedTxId } = result;
+    const mutations = this._rewriteMutationsSorted(
+      store.attrs,
+      pendingMutations,
+    );
+    const newStore = this._applyOptimisticUpdates(
+      store,
+      mutations,
+      processedTxId,
+    );
     const resp = instaql({ store: newStore, pageInfo, aggregate }, q);
 
     this._dataForQueryCache[hash] = {
@@ -852,6 +996,15 @@ export default class Reactor {
     };
 
     return resp;
+  }
+
+  _applyOptimisticUpdates(store, mutations, processedTxId) {
+    for (const [_, mut] of mutations) {
+      if (!mut['tx-id'] || (processedTxId && mut['tx-id'] > processedTxId)) {
+        store = s.transact(store, mut['tx-steps']);
+      }
+    }
+    return store;
   }
 
   /** Re-run instaql and call all callbacks with new data */
@@ -897,7 +1050,13 @@ export default class Reactor {
   pushTx = (chunks) => {
     try {
       const txSteps = instaml.transform(
-        { attrs: this.optimisticAttrs(), schema: this.config.schema },
+        {
+          attrs: this.optimisticAttrs(),
+          schema: this.config.schema,
+          stores: Object.values(this.querySubs.currentValue).map(
+            (sub) => sub?.result?.store,
+          ),
+        },
         chunks,
       );
       return this.pushOps(txSteps);
@@ -913,10 +1072,14 @@ export default class Reactor {
    */
   pushOps = (txSteps, error) => {
     const eventId = uuid();
+    const mutations = [...this.pendingMutations.currentValue.values()];
+    const order = Math.max(0, ...mutations.map((mut) => mut.order || 0)) + 1;
     const mutation = {
-      op: "transact",
-      "tx-steps": txSteps,
+      op: 'transact',
+      'tx-steps': txSteps,
+      created: Date.now(),
       error,
+      order,
     };
     this.pendingMutations.set((prev) => {
       prev.set(eventId, mutation);
@@ -933,8 +1096,9 @@ export default class Reactor {
   };
 
   shutdown() {
+    this._log.info('[shutdown]', this.config.appId);
     this._isShutdown = true;
-    this._ws.close();
+    this._ws?.close();
   }
 
   /**
@@ -946,14 +1110,14 @@ export default class Reactor {
    */
   _sendMutation(eventId, mutation) {
     if (mutation.error) {
-      this._handleMutationError("error", eventId, {
+      this._handleMutationError('error', eventId, {
         error: mutation.error,
         message: mutation.error.message,
       });
       return;
     }
     if (this.status !== STATUS.AUTHENTICATED) {
-      this._finishTransaction("enqueued", eventId);
+      this._finishTransaction('enqueued', eventId);
       return;
     }
     const timeoutMs = Math.max(
@@ -962,16 +1126,9 @@ export default class Reactor {
     );
 
     if (!this._isOnline) {
-      this._finishTransaction("enqueued", eventId);
+      this._finishTransaction('enqueued', eventId);
     } else {
       this._trySend(eventId, mutation);
-
-      // If a transaction is pending for over 3 seconds,
-      // we want to unblock the UX, so mark it as pending
-      // and keep trying to process the transaction in the background
-      setTimeout(() => {
-        this._finishTransaction("pending", eventId);
-      }, 3_000);
 
       setTimeout(() => {
         if (!this._isOnline) {
@@ -980,8 +1137,8 @@ export default class Reactor {
         // If we are here, this means that we have sent this mutation, we are online
         // but we have not received a response. If it's this long, something must be wrong,
         // so we error with a timeout.
-        this._handleMutationError("timeout", eventId, {
-          message: "transaction timed out",
+        this._handleMutationError('timeout', eventId, {
+          message: 'transaction timed out',
         });
       }, timeoutMs);
     }
@@ -999,23 +1156,82 @@ export default class Reactor {
     // doing this defensively just in case.
     const safeSubs = subs.filter((x) => x);
     safeSubs.forEach(({ eventId, q }) => {
-      this._trySendAuthed(eventId, { op: "add-query", q });
+      this._trySendAuthed(eventId, { op: 'add-query', q });
     });
 
     Object.values(this.queryOnceDfds)
       .flat()
       .forEach(({ eventId, q }) => {
-        this._trySendAuthed(eventId, { op: "add-query", q });
+        this._trySendAuthed(eventId, { op: 'add-query', q });
       });
 
-    const muts = this._rewriteMutations(
+    const muts = this._rewriteMutationsSorted(
       this.attrs,
       this.pendingMutations.currentValue,
     );
-    muts.forEach((mut, eventId) => {
-      if (!mut["tx-id"]) {
+    muts.forEach(([eventId, mut]) => {
+      if (!mut['tx-id']) {
         this._sendMutation(eventId, mut);
       }
+    });
+  }
+
+  /**
+   * Clean up pendingMutations that all queries have seen
+   */
+  _cleanupPendingMutationsQueries() {
+    let minProcessedTxId = Number.MAX_SAFE_INTEGER;
+    for (const { result } of Object.values(this.querySubs.currentValue)) {
+      if (result?.processedTxId) {
+        minProcessedTxId = Math.min(minProcessedTxId, result?.processedTxId);
+      }
+    }
+
+    this.pendingMutations.set((prev) => {
+      for (const [eventId, mut] of Array.from(prev.entries())) {
+        if (mut['tx-id'] && mut['tx-id'] <= minProcessedTxId) {
+          prev.delete(eventId);
+        }
+      }
+      return prev;
+    });
+  }
+
+  /**
+   * After mutations is confirmed by server, we give each query 30 sec
+   * to update its results. If that doesn't happen, we assume query is
+   * unaffected by this mutation and it’s safe to delete it from local queue
+   */
+  _cleanupPendingMutationsTimeout() {
+    const now = Date.now();
+
+    if (this.pendingMutations.currentValue.size < 200) {
+      return;
+    }
+
+    this.pendingMutations.set((prev) => {
+      let deleted = false;
+      let timeless = false;
+
+      for (const [eventId, mut] of Array.from(prev.entries())) {
+        if (!mut.confirmed) {
+          timeless = true;
+        }
+        if (mut.confirmed && mut.confirmed + PENDING_TX_CLEANUP_TIMEOUT < now) {
+          prev.delete(eventId);
+          deleted = true;
+        }
+      }
+
+      // backwards compat for mutations with no `confirmed`
+      if (deleted && timeless) {
+        for (const [eventId, mut] of Array.from(prev.entries())) {
+          if (!mut.confirmed) {
+            prev.delete(eventId);
+          }
+        }
+      }
+      return prev;
     });
   }
 
@@ -1031,48 +1247,52 @@ export default class Reactor {
       return;
     }
     if (!ignoreLogging[msg.op]) {
-      log.info("[send]", this._ws._id, msg.op, msg);
+      this._log.info('[send]', this._ws._id, msg.op, msg);
     }
-    this._ws.send(JSON.stringify({ "client-event-id": eventId, ...msg }));
+    this._ws.send(JSON.stringify({ 'client-event-id': eventId, ...msg }));
   }
 
   _wsOnOpen = (e) => {
     const targetWs = e.target;
     if (this._ws !== targetWs) {
-      log.info(
-        "[socket][open]",
+      this._log.info(
+        '[socket][open]',
         targetWs._id,
-        "skip; this is no longer the current ws",
+        'skip; this is no longer the current ws',
       );
       return;
     }
-    log.info("[socket][open]", this._ws._id);
+    this._log.info('[socket][open]', this._ws._id);
     this._setStatus(STATUS.OPENED);
-    this.getCurrentUser().then((resp) => {
-      this._trySend(uuid(), {
-        op: "init",
-        "app-id": this.config.appId,
-        "refresh-token": resp.user?.["refresh_token"],
-        versions: this.versions,
-        // If an admin token is provided for an app, we will
-        // skip all permission checks. This is an advanced feature,
-        // to let users write internal tools
-        // This option is not exposed in `Config`, as it's
-        // not ready for prme time
-        "__admin-token": this.config.__adminToken,
+    this.getCurrentUser()
+      .then((resp) => {
+        this._trySend(uuid(), {
+          op: 'init',
+          'app-id': this.config.appId,
+          'refresh-token': resp.user?.['refresh_token'],
+          versions: this.versions,
+          // If an admin token is provided for an app, we will
+          // skip all permission checks. This is an advanced feature,
+          // to let users write internal tools
+          // This option is not exposed in `Config`, as it's
+          // not ready for prime time
+          '__admin-token': this.config.__adminToken,
+        });
+      })
+      .catch((e) => {
+        this._log.error('[socket][error]', targetWs._id, e);
       });
-    });
   };
 
   _wsOnMessage = (e) => {
     const targetWs = e.target;
     const m = JSON.parse(e.data.toString());
     if (this._ws !== targetWs) {
-      log.info(
-        "[socket][message]",
+      this._log.info(
+        '[socket][message]',
         targetWs._id,
         m,
-        "skip; this is no longer the current ws",
+        'skip; this is no longer the current ws',
       );
       return;
     }
@@ -1082,23 +1302,23 @@ export default class Reactor {
   _wsOnError = (e) => {
     const targetWs = e.target;
     if (this._ws !== targetWs) {
-      log.info(
-        "[socket][error]",
+      this._log.info(
+        '[socket][error]',
         targetWs._id,
-        "skip; this is no longer the current ws",
+        'skip; this is no longer the current ws',
       );
       return;
     }
-    log.error("[socket][error]", targetWs._id, e);
+    this._log.error('[socket][error]', targetWs._id, e);
   };
 
   _wsOnClose = (e) => {
     const targetWs = e.target;
     if (this._ws !== targetWs) {
-      log.info(
-        "[socket][close]",
+      this._log.info(
+        '[socket][close]',
         targetWs._id,
-        "skip; this is no longer the current ws",
+        'skip; this is no longer the current ws',
       );
       return;
     }
@@ -1110,17 +1330,17 @@ export default class Reactor {
     }
 
     if (this._isShutdown) {
-      log.info(
-        "[socket][close]",
+      this._log.info(
+        '[socket][close]',
         targetWs._id,
-        "Reactor has been shut down and will not reconnect",
+        'Reactor has been shut down and will not reconnect',
       );
       return;
     }
-    log.info(
-      "[socket][close]",
+    this._log.info(
+      '[socket][close]',
       targetWs._id,
-      "schedule reconnect, ms =",
+      'schedule reconnect, ms =',
       this._reconnectTimeoutMs,
     );
     setTimeout(() => {
@@ -1129,10 +1349,10 @@ export default class Reactor {
         10000,
       );
       if (!this._isOnline) {
-        log.info(
-          "[socket][close]",
+        this._log.info(
+          '[socket][close]',
           targetWs._id,
-          "we are offline, no need to start socket",
+          'we are offline, no need to start socket',
         );
         return;
       }
@@ -1141,14 +1361,22 @@ export default class Reactor {
   };
 
   _startSocket() {
+    if (this._isShutdown) {
+      this._log.info(
+        '[socket][start]',
+        this.config.appId,
+        'Reactor has been shut down and will not start a new socket',
+      );
+      return;
+    }
     if (this._ws && this._ws.readyState == WS_CONNECTING_STATUS) {
       // Our current websocket is in a 'connecting' state.
       // There's no need to start another one, as the socket is
       // effectively fresh.
-      log.info(
-        "[socket][start]",
+      this._log.info(
+        '[socket][start]',
         this._ws._id,
-        "maintained as current ws, we were still in a connecting state",
+        'maintained as current ws, we were still in a connecting state',
       );
       return;
     }
@@ -1160,7 +1388,7 @@ export default class Reactor {
     this._ws.onmessage = this._wsOnMessage;
     this._ws.onclose = this._wsOnClose;
     this._ws.onerror = this._wsOnError;
-    log.info("[socket][start]", this._ws._id);
+    this._log.info('[socket][start]', this._ws._id);
     if (prevWs?.readyState === WS_OPEN_STATUS) {
       // When the network dies, it doesn't always mean that our
       // socket connection will fire a close event.
@@ -1170,10 +1398,10 @@ export default class Reactor {
       //
       // This means that we have to make sure to kill the previous one ourselves.
       // c.f https://issues.chromium.org/issues/41343684
-      log.info(
-        "[socket][start]",
+      this._log.info(
+        '[socket][start]',
         this._ws._id,
-        "close previous ws id = ",
+        'close previous ws id = ',
         prevWs._id,
       );
       prevWs.close();
@@ -1207,34 +1435,34 @@ export default class Reactor {
   // ----
   // Auth
   _replaceUrlAfterOAuth() {
-    if (typeof URL === "undefined") {
+    if (typeof URL === 'undefined') {
       return;
     }
     const url = new URL(window.location.href);
     if (url.searchParams.get(OAUTH_REDIRECT_PARAM)) {
       const startUrl = url.toString();
       url.searchParams.delete(OAUTH_REDIRECT_PARAM);
-      url.searchParams.delete("code");
-      url.searchParams.delete("error");
+      url.searchParams.delete('code');
+      url.searchParams.delete('error');
       const newPath =
         url.pathname +
-        (url.searchParams.size ? "?" + url.searchParams : "") +
+        (url.searchParams.size ? '?' + url.searchParams : '') +
         url.hash;
       // Note: In next.js, this will revert to the old state if user navigates
       //       back. We would need to allow framework specific routing to work
       //       around that problem.
-      history.replaceState(history.state, "", newPath);
+      history.replaceState(history.state, '', newPath);
 
       // navigation is part of the HTML spec, but not supported by Safari
       // or Firefox yet:
       // https://developer.mozilla.org/en-US/docs/Web/API/Navigation_API#browser_compatibility
       if (
         // @ts-ignore (waiting for ts support)
-        typeof navigation === "object" &&
+        typeof navigation === 'object' &&
         // @ts-ignore (waiting for ts support)
-        typeof navigation.addEventListener === "function" &&
+        typeof navigation.addEventListener === 'function' &&
         // @ts-ignore (waiting for ts support)
-        typeof navigation.removeEventListener === "function"
+        typeof navigation.removeEventListener === 'function'
       ) {
         let ran = false;
 
@@ -1244,18 +1472,18 @@ export default class Reactor {
           if (!ran) {
             ran = true;
             // @ts-ignore (waiting for ts support)
-            navigation.removeEventListener("navigate", listener);
+            navigation.removeEventListener('navigate', listener);
             if (
               !e.userInitiated &&
-              e.navigationType === "replace" &&
+              e.navigationType === 'replace' &&
               e.destination?.url === startUrl
             ) {
-              history.replaceState(history.state, "", newPath);
+              history.replaceState(history.state, '', newPath);
             }
           }
         };
         // @ts-ignore (waiting for ts support)
-        navigation.addEventListener("navigate", listener);
+        navigation.addEventListener('navigate', listener);
       }
     }
   }
@@ -1266,9 +1494,9 @@ export default class Reactor {
    */
   async _oauthLoginInit() {
     if (
-      typeof window === "undefined" ||
-      typeof window.location === "undefined" ||
-      typeof URLSearchParams === "undefined"
+      typeof window === 'undefined' ||
+      typeof window.location === 'undefined' ||
+      typeof URLSearchParams === 'undefined'
     ) {
       return null;
     }
@@ -1277,12 +1505,12 @@ export default class Reactor {
       return null;
     }
 
-    const error = params.get("error");
+    const error = params.get('error');
     if (error) {
       this._replaceUrlAfterOAuth();
       return { error: { message: error } };
     }
-    const code = params.get("code");
+    const code = params.get('code');
     if (!code) {
       return null;
     }
@@ -1297,15 +1525,15 @@ export default class Reactor {
       return null;
     } catch (e) {
       if (
-        e?.body?.type === "record-not-found" &&
-        e?.body?.hint?.["record-type"] === "app-oauth-code" &&
+        e?.body?.type === 'record-not-found' &&
+        e?.body?.hint?.['record-type'] === 'app-oauth-code' &&
         (await this._hasCurrentUser())
       ) {
         // We probably just weren't able to clean up the URL, so
         // let's just ignore this error
         return null;
       }
-      const message = e?.body?.message || "Error logging in.";
+      const message = e?.body?.message || 'Error logging in.';
       return { error: { message } };
     }
   }
@@ -1338,6 +1566,14 @@ export default class Reactor {
       unsubbed = true;
       this.authCbs = this.authCbs.filter((x) => x !== cb);
     };
+  }
+
+  async getAuth() {
+    const { user, error } = await this.getCurrentUser();
+    if (error) {
+      throw error;
+    }
+    return user;
   }
 
   subscribeConnectionStatus(cb) {
@@ -1422,9 +1658,9 @@ export default class Reactor {
     this.updateUser(newUser);
 
     try {
-      this._broadcastChannel?.postMessage({ type: "auth" });
+      this._broadcastChannel?.postMessage({ type: 'auth' });
     } catch (error) {
-      console.error("Error posting message to broadcast channel", error);
+      console.error('Error posting message to broadcast channel', error);
     }
   }
 
@@ -1473,18 +1709,31 @@ export default class Reactor {
     return res;
   }
 
-  async signOut() {
-    const currentUser = await this.getCurrentUser();
+  potentiallyInvalidateToken(currentUser, opts) {
     const refreshToken = currentUser?.user?.refresh_token;
-    if (refreshToken) {
-      try {
-        await authAPI.signOut({
-          apiURI: this.config.apiURI,
-          appId: this.config.appId,
-          refreshToken,
-        });
-      } catch (e) {}
+    if (!refreshToken) {
+      return;
     }
+    const wantsToSkip = opts.invalidateToken === false;
+    if (wantsToSkip) {
+      this._log.info('[auth-invalidate] skipped invalidateToken');
+      return;
+    }
+    authAPI
+      .signOut({
+        apiURI: this.config.apiURI,
+        appId: this.config.appId,
+        refreshToken,
+      })
+      .then(() => {
+        this._log.info('[auth-invalidate] completed invalidateToken');
+      })
+      .catch((e) => {});
+  }
+
+  async signOut(opts) {
+    const currentUser = await this.getCurrentUser();
+    this.potentiallyInvalidateToken(currentUser, opts);
     await this.changeCurrentUser(null);
   }
 
@@ -1500,6 +1749,11 @@ export default class Reactor {
     return `${apiURI}/runtime/oauth/start?app_id=${appId}&client_name=${clientName}&redirect_uri=${redirectURL}`;
   }
 
+  /**
+   * @param {Object} params
+   * @param {string} params.code - The code received from the OAuth service.
+   * @param {string} [params.codeVerifier] - The code verifier used to generate the code challenge.
+   */
   async exchangeCodeForToken({ code, codeVerifier }) {
     const res = await authAPI.exchangeCodeForToken({
       apiURI: this.config.apiURI,
@@ -1541,7 +1795,12 @@ export default class Reactor {
   // --------
   // Rooms
 
-  joinRoom(roomId) {
+  /**
+   * @param {string} roomId
+   * @param {any | null | undefined} [initialData] -- initial presence data to send when joining the room
+   * @returns () => void
+   */
+  joinRoom(roomId, initialData) {
     if (!this._rooms[roomId]) {
       this._rooms[roomId] = {
         isConnected: false,
@@ -1551,7 +1810,13 @@ export default class Reactor {
 
     this._presence[roomId] = this._presence[roomId] || {};
 
-    this._tryJoinRoom(roomId);
+    if (initialData) {
+      this._presence[roomId].result = this._presence[roomId].result || {};
+      this._presence[roomId].result.user = initialData;
+      this._notifyPresenceSubs(roomId);
+    }
+
+    this._tryJoinRoom(roomId, initialData);
 
     return () => {
       this._cleanupRoom(roomId);
@@ -1620,24 +1885,24 @@ export default class Reactor {
 
   _trySetPresence(roomId, data) {
     this._trySendAuthed(uuid(), {
-      op: "set-presence",
-      "room-id": roomId,
+      op: 'set-presence',
+      'room-id': roomId,
       data,
     });
   }
 
-  _tryJoinRoom(roomId) {
-    this._trySendAuthed(uuid(), { op: "join-room", "room-id": roomId });
+  _tryJoinRoom(roomId, data) {
+    this._trySendAuthed(uuid(), { op: 'join-room', 'room-id': roomId, data });
     delete this._roomsPendingLeave[roomId];
   }
 
   _tryLeaveRoom(roomId) {
-    this._trySendAuthed(uuid(), { op: "leave-room", "room-id": roomId });
+    this._trySendAuthed(uuid(), { op: 'leave-room', 'room-id': roomId });
   }
 
   // TODO: look into typing again
   subscribePresence(roomType, roomId, opts, cb) {
-    const leaveRoom = this.joinRoom(roomId);
+    const leaveRoom = this.joinRoom(roomId, opts.data);
 
     const handler = { ...opts, roomId, cb, prev: null };
 
@@ -1662,7 +1927,7 @@ export default class Reactor {
   }
 
   _notifyPresenceSub(roomId, handler) {
-    const slice = this.getPresence("", roomId, handler);
+    const slice = this.getPresence('', roomId, handler);
 
     if (!slice) {
       return;
@@ -1676,6 +1941,33 @@ export default class Reactor {
     handler.cb(slice);
   }
 
+  _patchPresencePeers(roomId, edits) {
+    const peers = this._presence[roomId]?.result?.peers || {};
+    let sessions = Object.fromEntries(
+      Object.entries(peers).map(([k, v]) => [k, { data: v }]),
+    );
+    const myPresence = this._presence[roomId]?.result;
+    const newSessions = create(sessions, (draft) => {
+      for (let [path, op, value] of edits) {
+        switch (op) {
+          case '+':
+            insertInMutative(draft, path, value);
+            break;
+          case 'r':
+            assocInMutative(draft, path, value);
+            break;
+          case '-':
+            dissocInMutative(draft, path);
+            break;
+        }
+      }
+      // Ignore our own edits
+      delete draft[this._sessionId];
+    });
+
+    this._setPresencePeers(roomId, newSessions);
+  }
+
   _setPresencePeers(roomId, data) {
     const sessions = { ...data };
     // no need to keep track of `user`
@@ -1684,9 +1976,9 @@ export default class Reactor {
       Object.entries(sessions).map(([k, v]) => [k, v.data]),
     );
 
-    this._presence[roomId] = this._presence[roomId] || {};
-    this._presence[roomId].result = this._presence[roomId].result || {};
-    this._presence[roomId].result.peers = peers;
+    this._presence = create(this._presence, (draft) => {
+      assocInMutative(draft, [roomId, 'result', 'peers'], peers);
+    });
   }
 
   // --------
@@ -1711,8 +2003,8 @@ export default class Reactor {
 
   _tryBroadcast(roomId, roomType, topic, data) {
     this._trySendAuthed(uuid(), {
-      op: "client-broadcast",
-      "room-id": roomId,
+      op: 'client-broadcast',
+      'room-id': roomId,
       roomType,
       topic,
       data,
@@ -1746,9 +2038,9 @@ export default class Reactor {
       const data = msg.data?.data;
 
       const peer =
-        msg.data["peer-id"] === this._sessionId
+        msg.data['peer-id'] === this._sessionId
           ? this._presence[room]?.result?.user
-          : this._presence[room]?.result?.peers?.[msg.data["peer-id"]];
+          : this._presence[room]?.result?.peers?.[msg.data['peer-id']];
 
       return cb(data, peer);
     });
@@ -1756,6 +2048,35 @@ export default class Reactor {
 
   // --------
   // Storage
+
+  async uploadFile(path, file, opts) {
+    const currentUser = await this.getCurrentUser();
+    const refreshToken = currentUser?.user?.refresh_token;
+    return StorageApi.uploadFile({
+      ...opts,
+      apiURI: this.config.apiURI,
+      appId: this.config.appId,
+      path: path,
+      file,
+      refreshToken: refreshToken,
+    });
+  }
+
+  async deleteFile(path) {
+    const currentUser = await this.getCurrentUser();
+    const refreshToken = currentUser?.user?.refresh_token;
+    const result = await StorageApi.deleteFile({
+      apiURI: this.config.apiURI,
+      appId: this.config.appId,
+      path,
+      refreshToken: refreshToken,
+    });
+
+    return result;
+  }
+
+  // Deprecated Storage API (Jan 2025)
+  // ---------------------------------
 
   async upload(path, file) {
     const currentUser = await this.getCurrentUser();
@@ -1783,18 +2104,5 @@ export default class Reactor {
     });
 
     return url;
-  }
-
-  async deleteFile(path) {
-    const currentUser = await this.getCurrentUser();
-    const refreshToken = currentUser?.user?.refresh_token;
-    const result = await StorageApi.deleteFile({
-      apiURI: this.config.apiURI,
-      appId: this.config.appId,
-      path: path,
-      refreshToken: refreshToken,
-    });
-
-    return result;
   }
 }

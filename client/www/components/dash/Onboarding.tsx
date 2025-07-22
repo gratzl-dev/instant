@@ -18,6 +18,8 @@ import {
   ScreenHeading,
   TextInput,
 } from '@/components/ui';
+import { useRouter } from 'next/router';
+import { signOut } from '@/lib/auth';
 
 type ProfileCreateState = { isLoading: boolean; error?: string };
 type AppError = { body: { message: string } | undefined };
@@ -56,7 +58,7 @@ export function submitProfile(token: string, profile: Profile) {
 
 export function createApp(
   token: string,
-  toCreate: { id: string; title: string; admin_token: string }
+  toCreate: { id: string; title: string; admin_token: string },
 ) {
   return jsonFetch(`${config.apiURI}/dash/apps`, {
     method: 'POST',
@@ -100,7 +102,7 @@ export function useDash(): [DashState, Dispatch<SetStateAction<DashState>>] {
           apps: undefined,
           profile: undefined,
         });
-      }
+      },
     );
   }, [token]);
 
@@ -282,6 +284,30 @@ export function OnboardingScreen(props: {
   );
 }
 
+function WithSignOut({ children }: { children: React.ReactNode }) {
+  const router = useRouter();
+  return (
+    <div className="flex h-full w-full">
+      <div className="absolute right-0 top-0 p-4">
+        <Button
+          className="w-full"
+          size="mini"
+          variant="subtle"
+          onClick={() => {
+            router.push('/');
+            setTimeout(() => {
+              signOut();
+            }, 150);
+          }}
+        >
+          Sign out
+        </Button>
+      </div>
+      {children}
+    </div>
+  );
+}
+
 export function Onboarding({
   onCreate,
 }: {
@@ -328,7 +354,7 @@ export function Onboarding({
           ...dashState,
           profile: undefined,
         });
-      }
+      },
     );
   };
 
@@ -361,18 +387,20 @@ export function Onboarding({
           apps: dashState.apps.filter((x) => x.id !== toCreate.id),
         });
         setSelectedPage(prevSelectedAppId);
-      }
+      },
     );
   };
 
   return (
-    <OnboardingScreen
-      profile={dashState.profile}
-      appCreateState={appCreateState}
-      profileCreateState={profileCreateState}
-      onProfileSubmit={onProfileSubmit}
-      onAppNameChange={onAppNameChange}
-      onAppCreate={onAppCreate}
-    />
+    <WithSignOut>
+      <OnboardingScreen
+        profile={dashState.profile}
+        appCreateState={appCreateState}
+        profileCreateState={profileCreateState}
+        onProfileSubmit={onProfileSubmit}
+        onAppNameChange={onAppNameChange}
+        onAppCreate={onAppCreate}
+      />
+    </WithSignOut>
   );
 }

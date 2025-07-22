@@ -1,4 +1,4 @@
-import NetInfo from "@react-native-community/netinfo";
+import NetInfo from '@react-native-community/netinfo';
 
 export default class NetworkListener {
   static async getIsOnline() {
@@ -7,7 +7,6 @@ export default class NetworkListener {
   }
   static listen(f) {
     return NetInfo.addEventListener((state) => {
-      console.log("connection change", state.isConnected);
       f(state.isConnected);
     });
   }

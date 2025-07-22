@@ -1,18 +1,22 @@
-import { test, expect } from "vitest";
-import zenecaAttrs from "./data/zeneca/attrs.json";
-import zenecaTriples from "./data/zeneca/triples.json";
+import { test, expect } from 'vitest';
+import zenecaAttrs from './data/zeneca/attrs.json';
+import zenecaTriples from './data/zeneca/triples.json';
 import {
   createStore,
   transact,
   allMapValues,
   toJSON,
   fromJSON,
-} from "../../src/store";
-import query from "../../src/instaql";
-import uuid from "../../src/utils/uuid";
-import { tx } from "../../src/instatx";
-import * as instaml from "../../src/instaml";
-import * as datalog from "../../src/datalog";
+  transact,
+} from '../../src/store';
+import query from '../../src/instaql';
+import uuid from '../../src/utils/uuid';
+import { tx } from '../../src/instatx';
+import * as instaml from '../../src/instaml';
+import * as datalog from '../../src/datalog';
+import * as instatx from '../../src/instatx';
+import { i, id } from '../../src';
+import { createLinkIndex } from '../../src/utils/linkIndex';
 
 const zenecaIdToAttr = zenecaAttrs.reduce((res, x) => {
   res[x.id] = x;
@@ -57,50 +61,50 @@ function checkIndexIntegrity(store) {
   for (const triple of eavTriples) {
     const [e, a, v] = triple;
     const attr = store.attrs[a];
-    if (attr["value-type"] === "ref") {
+    if (attr['value-type'] === 'ref') {
       expect(store.vae.get(v)?.get(a)?.get(e)).toEqual(triple);
     }
   }
 }
 
-test("simple add", () => {
+test('simple add', () => {
   const id = uuid();
-  const chunk = tx.users[id].update({ handle: "bobby" });
+  const chunk = tx.users[id].update({ handle: 'bobby' });
   const txSteps = instaml.transform({ attrs: store.attrs }, chunk);
   const newStore = transact(store, txSteps);
   expect(
     query({ store: newStore }, { users: {} }).data.users.map((x) => x.handle),
-  ).contains("bobby");
+  ).contains('bobby');
 
   checkIndexIntegrity(newStore);
 });
 
-test("cardinality-one add", () => {
+test('cardinality-one add', () => {
   const id = uuid();
   const chunk = tx.users[id]
-    .update({ handle: "bobby" })
-    .update({ handle: "bob" });
+    .update({ handle: 'bobby' })
+    .update({ handle: 'bob' });
   const txSteps = instaml.transform({ attrs: store.attrs }, chunk);
   const newStore = transact(store, txSteps);
   const ret = datalog
     .query(newStore, {
-      find: ["?v"],
-      where: [[id, "?attr", "?v"]],
+      find: ['?v'],
+      where: [[id, '?attr', '?v']],
     })
     .flatMap((vec) => vec[0]);
-  expect(ret).contains("bob");
-  expect(ret).not.contains("bobby");
+  expect(ret).contains('bob');
+  expect(ret).not.contains('bobby');
   checkIndexIntegrity(newStore);
 });
 
-test("link/unlink", () => {
+test('link/unlink', () => {
   const bookshelfId = uuid();
   const userId = uuid();
   const userChunk = tx.users[userId]
-    .update({ handle: "bobby" })
+    .update({ handle: 'bobby' })
     .link({ bookshelves: bookshelfId });
   const bookshelfChunk = tx.bookshelves[bookshelfId].update({
-    name: "my books",
+    name: 'my books',
   });
   const txSteps = instaml.transform({ attrs: store.attrs }, [
     userChunk,
@@ -112,17 +116,17 @@ test("link/unlink", () => {
       { store: newStore },
       {
         users: {
-          $: { where: { handle: "bobby" } },
+          $: { where: { handle: 'bobby' } },
           bookshelves: {},
         },
       },
     ).data.users.map((x) => [x.handle, x.bookshelves.map((x) => x.name)]),
-  ).toEqual([["bobby", ["my books"]]]);
+  ).toEqual([['bobby', ['my books']]]);
   checkIndexIntegrity(newStore);
 
   const secondBookshelfId = uuid();
   const secondBookshelfChunk = tx.bookshelves[secondBookshelfId].update({
-    name: "my second books",
+    name: 'my second books',
   });
   const unlinkFirstChunk = tx.users[userId]
     .unlink({
@@ -139,28 +143,28 @@ test("link/unlink", () => {
       { store: secondStore },
       {
         users: {
-          $: { where: { handle: "bobby" } },
+          $: { where: { handle: 'bobby' } },
           bookshelves: {},
         },
       },
     ).data.users.map((x) => [x.handle, x.bookshelves.map((x) => x.name)]),
-  ).toEqual([["bobby", ["my second books"]]]);
+  ).toEqual([['bobby', ['my second books']]]);
   checkIndexIntegrity(secondStore);
 });
 
-test("link/unlink multi", () => {
+test('link/unlink multi', () => {
   const bookshelfId1 = uuid();
   const bookshelfId2 = uuid();
   const userId = uuid();
   const userChunk = tx.users[userId]
-    .update({ handle: "bobby" })
+    .update({ handle: 'bobby' })
     .link({ bookshelves: [bookshelfId1, bookshelfId2] });
 
   const bookshelf1Chunk = tx.bookshelves[bookshelfId1].update({
-    name: "my books 1",
+    name: 'my books 1',
   });
   const bookshelf2Chunk = tx.bookshelves[bookshelfId2].update({
-    name: "my books 2",
+    name: 'my books 2',
   });
   const txSteps = instaml.transform({ attrs: store.attrs }, [
     userChunk,
@@ -174,17 +178,17 @@ test("link/unlink multi", () => {
       { store: newStore },
       {
         users: {
-          $: { where: { handle: "bobby" } },
+          $: { where: { handle: 'bobby' } },
           bookshelves: {},
         },
       },
     ).data.users.map((x) => [x.handle, x.bookshelves.map((x) => x.name)]),
-  ).toEqual([["bobby", ["my books 1", "my books 2"]]]);
+  ).toEqual([['bobby', ['my books 1', 'my books 2']]]);
   checkIndexIntegrity(newStore);
 
   const bookshelfId3 = uuid();
   const bookshelf3Chunk = tx.bookshelves[bookshelfId3].update({
-    name: "my books 3",
+    name: 'my books 3',
   });
   const unlinkChunk = tx.users[userId]
     .unlink({
@@ -201,23 +205,23 @@ test("link/unlink multi", () => {
       { store: secondStore },
       {
         users: {
-          $: { where: { handle: "bobby" } },
+          $: { where: { handle: 'bobby' } },
           bookshelves: {},
         },
       },
     ).data.users.map((x) => [x.handle, x.bookshelves.map((x) => x.name)]),
-  ).toEqual([["bobby", ["my books 3"]]]);
+  ).toEqual([['bobby', ['my books 3']]]);
   checkIndexIntegrity(secondStore);
 });
 
-test("delete entity", () => {
+test('delete entity', () => {
   const bookshelfId = uuid();
   const userId = uuid();
   const userChunk = tx.users[userId]
-    .update({ handle: "bobby" })
+    .update({ handle: 'bobby' })
     .link({ bookshelves: bookshelfId });
   const bookshelfChunk = tx.bookshelves[bookshelfId].update({
-    name: "my books",
+    name: 'my books',
   });
   const txSteps = instaml.transform({ attrs: store.attrs }, [
     userChunk,
@@ -228,17 +232,17 @@ test("delete entity", () => {
 
   const retOne = datalog
     .query(newStore, {
-      find: ["?v"],
-      where: [[bookshelfId, "?attr", "?v"]],
+      find: ['?v'],
+      where: [[bookshelfId, '?attr', '?v']],
     })
     .flatMap((vec) => vec[0]);
   const retTwo = datalog
     .query(newStore, {
-      find: ["?v"],
-      where: [["?v", "?attr", bookshelfId]],
+      find: ['?v'],
+      where: [['?v', '?attr', bookshelfId]],
     })
     .flatMap((vec) => vec[0]);
-  expect(retOne).contains("my books");
+  expect(retOne).contains('my books');
   expect(retTwo).contains(userId);
 
   const txStepsTwo = instaml.transform(
@@ -248,14 +252,14 @@ test("delete entity", () => {
   const newStoreTwo = transact(newStore, txStepsTwo);
   const retThree = datalog
     .query(newStoreTwo, {
-      find: ["?v"],
-      where: [[bookshelfId, "?attr", "?v"]],
+      find: ['?v'],
+      where: [[bookshelfId, '?attr', '?v']],
     })
     .flatMap((vec) => vec[0]);
   const retFour = datalog
     .query(newStoreTwo, {
-      find: ["?v"],
-      where: [["?v", "?attr", bookshelfId]],
+      find: ['?v'],
+      where: [['?v', '?attr', bookshelfId]],
     })
     .flatMap((vec) => vec[0]);
 
@@ -264,13 +268,100 @@ test("delete entity", () => {
   checkIndexIntegrity(newStoreTwo);
 });
 
-test("new attrs", () => {
+test('on-delete cascade', () => {
+  const book1 = uuid();
+  const book2 = uuid();
+  const book3 = uuid();
+  const chunk1 = tx.books[book1].update({
+    title: 'book1',
+    description: 'series',
+  });
+  const chunk2 = tx.books[book2]
+    .update({ title: 'book2', description: 'series' })
+    .link({ prequel: book1 });
+  const chunk3 = tx.books[book3]
+    .update({ title: 'book3', description: 'series' })
+    .link({ prequel: book2 });
+  const txSteps = instaml.transform({ attrs: store.attrs }, [
+    chunk1,
+    chunk2,
+    chunk3,
+  ]);
+  const newStore = transact(store, txSteps);
+  checkIndexIntegrity(newStore);
+  expect(
+    query(
+      { store: newStore },
+      { books: { $: { where: { description: 'series' } } } },
+    ).data.books.map((x) => x.title),
+  ).toEqual(['book1', 'book2', 'book3']);
+
+  const txStepsTwo = instaml.transform(
+    { attrs: newStore.attrs },
+    tx.books[book1].delete(),
+  );
+  const newStoreTwo = transact(newStore, txStepsTwo);
+  expect(
+    query(
+      { store: newStoreTwo },
+      { books: { $: { where: { description: 'series' } } } },
+    ).data.books.map((x) => x.title),
+  ).toEqual([]);
+});
+
+test('on-delete-reverse cascade', () => {
+  const book1 = uuid();
+  const book2 = uuid();
+  const book3 = uuid();
+
+  const chunk2 = tx.books[book2].update({
+    title: 'book2',
+    description: 'series',
+  });
+  const chunk3 = tx.books[book3].update({
+    title: 'book3',
+    description: 'series',
+  });
+  const chunk1 = tx.books[book1]
+    .update({
+      title: 'book1',
+      description: 'series',
+    })
+    .link({ next: [book2, book3] });
+  const txSteps = instaml.transform({ attrs: store.attrs }, [
+    chunk2,
+    chunk3,
+    chunk1,
+  ]);
+  const newStore = transact(store, txSteps);
+  checkIndexIntegrity(newStore);
+  expect(
+    query(
+      { store: newStore },
+      { books: { $: { where: { description: 'series' } } } },
+    ).data.books.map((x) => x.title),
+  ).toEqual(['book2', 'book3', 'book1']);
+
+  const txStepsTwo = instaml.transform(
+    { attrs: newStore.attrs },
+    tx.books[book1].delete(),
+  );
+  const newStoreTwo = transact(newStore, txStepsTwo);
+  expect(
+    query(
+      { store: newStoreTwo },
+      { books: { $: { where: { description: 'series' } } } },
+    ).data.books.map((x) => x.title),
+  ).toEqual([]);
+});
+
+test('new attrs', () => {
   const colorId = uuid();
   const userId = uuid();
   const userChunk = tx.users[userId]
-    .update({ handle: "bobby" })
+    .update({ handle: 'bobby' })
     .link({ colors: colorId });
-  const colorChunk = tx.colors[colorId].update({ name: "red" });
+  const colorChunk = tx.colors[colorId].update({ name: 'red' });
   const txSteps = instaml.transform({ attrs: store.attrs }, [
     userChunk,
     colorChunk,
@@ -281,73 +372,73 @@ test("new attrs", () => {
       { store: newStore },
       {
         users: {
-          $: { where: { handle: "bobby" } },
+          $: { where: { handle: 'bobby' } },
           colors: {},
         },
       },
     ).data.users.map((x) => [x.handle, x.colors.map((x) => x.name)]),
-  ).toEqual([["bobby", ["red"]]]);
+  ).toEqual([['bobby', ['red']]]);
 
   checkIndexIntegrity(newStore);
 });
 
-test("delete attr", () => {
+test('delete attr', () => {
   expect(
     query({ store }, { users: {} }).data.users.map((x) => [
       x.handle,
       x.fullName,
     ]),
   ).toEqual([
-    ["joe", "Joe Averbukh"],
-    ["alex", "Alex"],
-    ["stopa", "Stepan Parunashvili"],
-    ["nicolegf", "Nicole"],
+    ['joe', 'Joe Averbukh'],
+    ['alex', 'Alex'],
+    ['stopa', 'Stepan Parunashvili'],
+    ['nicolegf', 'Nicole'],
   ]);
   const fullNameAttr = instaml.getAttrByFwdIdentName(
     store.attrs,
-    "users",
-    "fullName",
+    'users',
+    'fullName',
   );
-  const newStore = transact(store, [["delete-attr", fullNameAttr.id]]);
+  const newStore = transact(store, [['delete-attr', fullNameAttr.id]]);
   expect(
     query({ store: newStore }, { users: {} }).data.users.map((x) => [
       x.handle,
       x.fullName,
     ]),
   ).toEqual([
-    ["joe", undefined],
-    ["alex", undefined],
-    ["stopa", undefined],
-    ["nicolegf", undefined],
+    ['joe', undefined],
+    ['alex', undefined],
+    ['stopa', undefined],
+    ['nicolegf', undefined],
   ]);
 
   checkIndexIntegrity(newStore);
 });
 
-test("update attr", () => {
+test('update attr', () => {
   expect(
     query({ store }, { users: {} }).data.users.map((x) => [
       x.handle,
       x.fullName,
     ]),
   ).toEqual([
-    ["joe", "Joe Averbukh"],
-    ["alex", "Alex"],
-    ["stopa", "Stepan Parunashvili"],
-    ["nicolegf", "Nicole"],
+    ['joe', 'Joe Averbukh'],
+    ['alex', 'Alex'],
+    ['stopa', 'Stepan Parunashvili'],
+    ['nicolegf', 'Nicole'],
   ]);
   const fullNameAttr = instaml.getAttrByFwdIdentName(
     store.attrs,
-    "users",
-    "fullName",
+    'users',
+    'fullName',
   );
-  const fwdIdent = fullNameAttr["forward-identity"];
+  const fwdIdent = fullNameAttr['forward-identity'];
   const newStore = transact(store, [
     [
-      "update-attr",
+      'update-attr',
       {
         id: fullNameAttr.id,
-        "forward-identity": [fwdIdent[0], "users", "fullNamez"],
+        'forward-identity': [fwdIdent[0], 'users', 'fullNamez'],
       },
     ],
   ]);
@@ -357,14 +448,165 @@ test("update attr", () => {
       x.fullNamez,
     ]),
   ).toEqual([
-    ["joe", "Joe Averbukh"],
-    ["alex", "Alex"],
-    ["stopa", "Stepan Parunashvili"],
-    ["nicolegf", "Nicole"],
+    ['joe', 'Joe Averbukh'],
+    ['alex', 'Alex'],
+    ['stopa', 'Stepan Parunashvili'],
+    ['nicolegf', 'Nicole'],
   ]);
 });
 
-test("JSON serialization round-trips", () => {
+test('JSON serialization round-trips', () => {
   const newStore = fromJSON(toJSON(store));
   expect(store).toEqual(newStore);
+});
+
+test('ruleParams no-ops', () => {
+  const id = uuid();
+  const chunk = tx.users[id]
+    .ruleParams({ guestId: 'bobby' })
+    .update({ handle: 'bobby' });
+
+  const txSteps = instaml.transform({ attrs: store.attrs }, chunk);
+  const newStore = transact(store, txSteps);
+  expect(
+    query({ store: newStore }, { users: {} }).data.users.map((x) => x.handle),
+  ).contains('bobby');
+
+  checkIndexIntegrity(newStore);
+});
+
+test('deepMerge', () => {
+  const gameId = uuid();
+  const gameStore = transact(
+    store,
+    instaml.transform(
+      { attrs: store.attrs },
+      tx.games[gameId].update({
+        state: {
+          score: 100,
+          playerStats: { health: 50, mana: 30, ambitions: { win: true } },
+          inventory: ['sword', 'potion'],
+          locations: ['forest', 'castle'],
+          level: 2,
+        },
+      }),
+    ),
+  );
+  const updatedStore = transact(
+    gameStore,
+    instaml.transform(
+      { attrs: gameStore.attrs },
+      tx.games[gameId].merge({
+        state: {
+          // Objects update deeply
+          playerStats: {
+            mana: 40,
+            stamina: 20,
+            ambitions: { acquireWisdom: true, find: ['love'] },
+          },
+          // arrays overwrite
+          inventory: ['shield'],
+          // null removes the key
+          score: null,
+          // undefined is ignored
+          level: undefined,
+          // undefined is kept in arrays
+          locations: ['forest', undefined, 'castle'],
+        },
+      }),
+    ),
+  );
+  const updatedGame = query(
+    { store: updatedStore },
+    { games: { $: { where: { id: gameId } } } },
+  ).data.games[0];
+  expect(updatedGame.state).toEqual({
+    playerStats: {
+      health: 50,
+      mana: 40,
+      stamina: 20,
+      ambitions: { win: true, acquireWisdom: true, find: ['love'] },
+    },
+    level: 2,
+    inventory: ['shield'],
+    locations: ['forest', undefined, 'castle'],
+  });
+  checkIndexIntegrity(updatedGame);
+});
+
+test('recursive links w same id', () => {
+  const schema = i.schema({
+    entities: {
+      $files: i.entity({
+        path: i.string().unique().indexed(),
+        url: i.string(),
+      }),
+      fakeUsers: i.entity({
+        email: i.string().unique().indexed().optional(),
+      }),
+      todos: i.entity({
+        completed: i.boolean().optional(),
+        title: i.string().optional(),
+      }),
+    },
+    links: {
+      todosCreatedBy: {
+        forward: {
+          on: 'todos',
+          has: 'one',
+          label: 'createdBy',
+          onDelete: 'cascade',
+        },
+        reverse: {
+          on: 'fakeUsers',
+          has: 'many',
+          label: 'todos',
+        },
+      },
+    },
+  });
+  const sameId = id();
+  const ops = [
+    instatx.tx.todos[sameId].update({
+      title: 'todo',
+      completed: false,
+    }),
+    instatx.tx.fakeUsers[sameId].update({
+      email: 'test@test.com',
+    }),
+    instatx.tx.todos[sameId].link({
+      createdBy: sameId,
+    }),
+  ];
+
+  const steps = instaml.transform({ attrs: {}, schema }, ops);
+  const store = createStore({}, [], true, createLinkIndex(schema), schema);
+  const newStore = transact(store, steps);
+
+  const result = query(
+    { store: newStore, pageInfo: {}, aggregate: {} },
+    {
+      todos: {},
+      fakeUsers: {},
+    },
+  );
+
+  expect(result.data.todos.length).toBe(1);
+  expect(result.data.fakeUsers.length).toBe(1);
+
+  const removeOp = [instatx.tx.todos[sameId].delete()];
+
+  const removeSteps = instaml.transform({ attrs: store.attrs }, removeOp);
+  const postRemoveStore = transact(newStore, removeSteps);
+
+  const removeResult = query(
+    { store: postRemoveStore, pageInfo: {}, aggregate: {} },
+    {
+      todos: {},
+      fakeUsers: {},
+    },
+  );
+
+  expect(removeResult.data.todos.length).toBe(0);
+  expect(removeResult.data.fakeUsers.length).toBe(1);
 });

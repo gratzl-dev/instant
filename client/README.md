@@ -16,6 +16,8 @@ This houses Instant's javascript monorepo! Here's the lay of the land:
       3. [`@instantdb/react-native`](./packages/react-native)
       4. [`@instantdb/admin`](./packages/admin)
       5. [`instant-cli`.](./packages/cli/)
+      6. [`@instantdb/platform`](./packages/platform)
+      7. [`@instantdb/mcp`](./packages/mcp)
 3. [`sandbox/`](./sandbox/)
    1. We built a few example apps, to make it easy to develop against the local version of `packages`.
 
@@ -30,7 +32,7 @@ pnpm i
 make dev
 ```
 
-With that, all frontend code should be up and running! 
+With that, all frontend code should be up and running!
 
 ## Dashboard & Docs
 
@@ -43,20 +45,21 @@ If you press `cmd + shift + 9`, you'll also see a devtool window pop up. This ca
 Right now all backend requests will go to api.instantdb.com. If you want to develop against your local backend, load [localhost:3000](http://localhost:3000), and set the `devBackend` flag:
 
 ```javascript
-localStorage.setItem("devBackend", true);
+localStorage.setItem('devBackend', true);
 ```
 
 Now all requests will go to your local backend at [localhost:8888](http://localhost:8888). If you haven't set up a local backend, follow the [server README](../server/README.md)
 
 ### Show client logs
 
-The instant client can show development logs. You can turn this on by writing: 
+The instant client can show development logs. You can turn this on by writing:
 
-```
-localStorage.setItem("__instantLogging", true);
+```javascript
+localStorage.setItem('__instantLogging', true);
 ```
 
 ### Running a local app
+
 You can create local apps by following these steps
 
 1. On localhost:3000, click "Sign up" in the upper right corner.
@@ -68,18 +71,18 @@ You can create local apps by following these steps
 
 You can then connect to this app in a new project with the following snippet
 
-```
-const APP_ID = '<your app id from your own server>'
+```javascript
+const APP_ID = '<your app id from your own server>';
 const db = init({
   appId: APP_ID,
-  apiURI: "http://localhost:8888",
-  websocketURI: "ws://localhost:8888/runtime/session",
+  apiURI: 'http://localhost:8888',
+  websocketURI: 'ws://localhost:8888/runtime/session',
 });
 ```
 
 ## Packages and sandbox
 
-All client SDKs live in `packages/`. 
+All client SDKs live in `packages/`.
 
 To develop against them, we've created a few `sandbox` examples. These examples let you locally test changes to the client SDK. We recommend you create an app in your dev environment and use it in each directories `.env` file
 
@@ -91,6 +94,25 @@ Based on what you change, you'll play with different examples:
 4. [`@instantdb/admin`](./packages/admin) ➡ [`sandbox/admin-sdk-express`](./sandbox/admin-sdk-express/)
 
 Check out the sandbox READMEs to see how to run them.
+
+## Internal Apps
+
+We also have a few internal pages and apps we use for things like metrics and
+feedback. For simple pages like '/overview' we just use a Next.js page. For more
+complex pages or apps we separate logic across
+
+- `www/lib` for app configuration
+- `www/components` for React components
+- `www/pages` for Next.js pages
+
+To illustrate a concrete example, providing feedback for the docs is powered by it's own Instant
+app! We also have an internal dashboard to view feedback. Some notes on how this
+is structured:
+
+- The feedback app configuration is in `www/lib/intern/docs-feedback/`
+- The public feedback component is in `www/components/docs/`
+- The internal feedback dashboard page is in `www/pages/intern/docs-feedback.tsx`
+- The internal feedback dashboard components are in `www/components/intern/docs-feedback/`
 
 # Questions?
 

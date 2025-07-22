@@ -2,6 +2,8 @@ export const isBrowser = typeof window != 'undefined';
 
 export const isDev = process.env.NODE_ENV === 'development';
 
+const isStaging = process.env.NEXT_PUBLIC_STAGING === 'true';
+
 const devBackend = getLocal('devBackend');
 
 let localPort = '8888';
@@ -66,3 +68,10 @@ export function setLocal(k: string, v: any) {
 export const localStorageFlagPrefix = `__instant__flag__`;
 
 export const cliOauthParamName = '_cli_oauth_ticket';
+
+export const discordInviteUrl = 'https://discord.com/invite/VU53p7uQcE';
+
+export const discordOAuthAppsFeedbackInviteUrl =
+  'https://discord.gg/GrvbPTBDEX';
+
+export const bugsAndQuestionsInviteUrl = 'https://discord.gg/unA5vyV6mP';

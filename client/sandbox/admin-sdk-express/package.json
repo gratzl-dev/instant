@@ -1,9 +1,10 @@
 {
-  "name": "sandbox-node",
+  "name": "sandbox/admin-sdk-express",
   "version": "0.0.1",
   "description": "Test script for admin SDK",
+  "type": "module",
   "scripts": {
-    "dev": "node --watch -r ts-node/register ./src/index.ts"
+    "dev": "node --watch --watch-preserve-output -r ts-node/register ./src/index.ts"
   },
   "dependencies": {
     "@instantdb/admin": "workspace:*",

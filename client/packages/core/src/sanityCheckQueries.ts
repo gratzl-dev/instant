@@ -7,7 +7,7 @@ import type {
   InstantObject,
   Query,
   QueryResponse,
-} from "./queryTypes";
+} from './queryTypes.ts';
 
 /**
  * The purpose of these sanity checks:
@@ -54,14 +54,14 @@ const sanityCheckQueries = () => {
   // @ts-expect-error
   const r2 = dummyQuery({ users: 1 });
   // @ts-expect-error
-  const r3 = dummyQuery({ users: "" });
+  const r3 = dummyQuery({ users: '' });
 
   // ----------------------
   // Good $ clauses succeed
   const r4 = dummyQuery({ users: { $: { where: { foo: 1 } } } });
-  const r5 = dummyQuery({ users: { $: { where: { foo: "str" } } } });
+  const r5 = dummyQuery({ users: { $: { where: { foo: 'str' } } } });
   const r6 = dummyQuery({ users: { $: { where: { foo: true } } } });
-  const r7 = dummyQuery({ users: { $: { where: { "foo.bar.baz": 1 } } } });
+  const r7 = dummyQuery({ users: { $: { where: { 'foo.bar.baz': 1 } } } });
   const s1 = dummyQuery({
     users: { $: { where: { foo: { in: [1, 2, 3] } } } },
   });
@@ -73,14 +73,14 @@ const sanityCheckQueries = () => {
   });
   // You can have a field named or
   const t2 = dummyQuery({
-    users: { $: { where: { or: "fieldNamedOr" } } },
+    users: { $: { where: { or: 'fieldNamedOr' } } },
   });
   const t3 = dummyQuery({
     users: { $: { where: { and: [{ foo: 1 }] } } },
   });
   // You can have a field named and
   const t4 = dummyQuery({
-    users: { $: { where: { and: "fieldNamedAnd" } } },
+    users: { $: { where: { and: 'fieldNamedAnd' } } },
   });
   const t5 = dummyQuery({
     users: { $: { where: { and: [{ or: [{ foo: 1 }] }] } } },
@@ -96,9 +96,9 @@ const sanityCheckQueries = () => {
     users: { $: { where: { foo: 1 }, limit: 10, offset: 10 } },
   });
   const cursor: Cursor = [
-    "61935703-bec6-4ade-ad9b-8bf382b92f69",
-    "995f5a9b-9ae1-4e59-97d1-df33afb44aee",
-    "61935703-bec6-4ade-ad9b-8bf382b92f69",
+    '61935703-bec6-4ade-ad9b-8bf382b92f69',
+    '995f5a9b-9ae1-4e59-97d1-df33afb44aee',
+    '61935703-bec6-4ade-ad9b-8bf382b92f69',
     10,
   ];
   const t9 = dummyQuery({
@@ -116,13 +116,20 @@ const sanityCheckQueries = () => {
   });
 
   const t13 = dummyQuery({
-    users: { $: { where: { val: { $not: "a" } } } },
+    users: { $: { where: { val: { $not: 'a' } } } },
+  });
+
+  const t14 = dummyQuery({
+    users: {
+      $: { fields: ['name', 'age', 'dob'] },
+      posts: { $: { fields: ['title'] } },
+    },
   });
 
   // ------------------
   // Bad $ clauses fail
   // @ts-expect-error
-  const r8 = dummyQuery({ users: { $: { where: "foo" } } });
+  const r8 = dummyQuery({ users: { $: { where: 'foo' } } });
   // @ts-expect-error
   const r9 = dummyQuery({ users: { $: { where: { foo: {} } } } });
   // @ts-expect-error
@@ -138,12 +145,12 @@ const sanityCheckQueries = () => {
 
   const s4 = dummyQuery({
     // @ts-expect-error
-    users: { $: { where: { val: { $isNull: "a" } } } },
+    users: { $: { where: { val: { $isNull: 'a' } } } },
   });
 
   const s5 = dummyQuery({
     // @ts-expect-error
-    users: { $: { where: { val: { $not: { val: "a" } } } } },
+    users: { $: { where: { val: { $not: { val: 'a' } } } } },
   });
 
   // ----------------
@@ -161,6 +168,11 @@ const sanityCheckQueries = () => {
   // Bad nested queries fail
   // @ts-expect-error
   const r14 = dummyQuery({ users: { foo: 1 } });
+
+  const r15 = dummyQuery({
+    // @ts-expect-error
+    users: { $: { fields: 'name' } },
+  });
 };
 const sanityCheckSchemalessResponses = () => {
   // Simple Response

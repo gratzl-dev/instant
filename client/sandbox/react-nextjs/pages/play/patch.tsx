@@ -1,11 +1,11 @@
-import { init, tx } from "@instantdb/react";
-import { useRef } from "react";
-import config from "../../config";
+import { init, tx } from '@instantdb/react';
+import { useRef } from 'react';
+import config from '../../config';
 
 const db = init(config);
 
-const singletonIdX = "23c755b5-a703-4354-b0d2-d921d8846722";
-const singletonIdY = "23c755b5-a703-4354-b0d2-d921d8846723";
+const singletonIdX = '23c755b5-a703-4354-b0d2-d921d8846722';
+const singletonIdY = '23c755b5-a703-4354-b0d2-d921d8846723';
 
 export default function Patch() {
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -26,7 +26,7 @@ export default function Patch() {
         <textarea
           className="bg-gray-50"
           ref={ref}
-          defaultValue={JSON.stringify({ new_key: "edit_me" })}
+          defaultValue={JSON.stringify({ new_key: 'edit_me' })}
         ></textarea>
         <button className="border border-black" onClick={merge}>
           merge `nestedData` with above input
@@ -37,6 +37,9 @@ export default function Patch() {
       </button>
       <button className="border border-black" onClick={mergeWithDeepUndef}>
         merge `nestedData` with `{`{new_key:undefined}`}`
+      </button>
+      <button className="border border-black" onClick={mergeWithUndefArray}>
+        merge `nestedData` with `{`{new_key:[1, undefined, 2]}`}`
       </button>
       <button className="border border-black" onClick={deleteAttr}>
         delete `nestedData` attribute
@@ -72,6 +75,14 @@ export default function Patch() {
     db.transact([
       tx.blocks[singletonIdX].merge({
         nestedData: { new_key: undefined },
+      }),
+    ]);
+  }
+
+  function mergeWithUndefArray() {
+    db.transact([
+      tx.blocks[singletonIdX].merge({
+        nestedData: { new_key: [1, undefined, 2] },
       }),
     ]);
   }

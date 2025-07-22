@@ -3,13 +3,13 @@ import {
   init as core_init,
   init_experimental as _a,
   BackwardsCompatibleSchema,
-} from "@instantdb/core";
-import { init as react_init, init_experimental as _b } from "@instantdb/react";
+} from '@instantdb/core';
+import { init as react_init, init_experimental as _b } from '@instantdb/react';
 import {
   init as react_native_init,
   init_experimental as _c,
-} from "@instantdb/react-native";
-import { init as admin_init, init_experimental as _d } from "@instantdb/admin";
+} from '@instantdb/react-native';
+import { init as admin_init, init_experimental as _d } from '@instantdb/admin';
 
 type Message = {
   content: string;
@@ -24,7 +24,7 @@ type Schema = {
   creator: User;
 };
 
-type EmojiName = "fire" | "wave" | "confetti" | "heart";
+type EmojiName = 'fire' | 'wave' | 'confetti' | 'heart';
 
 type Rooms = {
   chat: {
@@ -52,10 +52,10 @@ const coreDB = core_init<SchemaDef>({
 });
 
 // rooms
-const coreRoom = coreDB.joinRoom("chat");
+const coreRoom = coreDB.joinRoom('chat');
 coreRoom.getPresence({});
-coreRoom.publishTopic("emoji", {
-  name: "confetti",
+coreRoom.publishTopic('emoji', {
+  name: 'confetti',
   rotationAngle: 0,
   directionAngle: 0,
 });
@@ -71,8 +71,8 @@ coreDB.subscribeQuery({ messages: { creator: {} } }, (result) => {
 
 // transactions
 coreDB.tx.messages[id()]
-  .update({ content: "Hello world" })
-  .link({ creator: "foo" });
+  .update({ content: 'Hello world' })
+  .link({ creator: 'foo' });
 
 // ----
 // React
@@ -83,11 +83,26 @@ const reactDB = react_init<SchemaDef>({
 
 function ReactNormalApp() {
   // rooms
-  const reactRoom = reactDB.room("chat");
-  const reactPresence = reactRoom.usePresence({ keys: ["name"] });
-  const _reactPublishEmoji = reactRoom.usePublishTopic("emoji");
+  const reactRoom = reactDB.room('chat');
+  const reactPresence = reactRoom.usePresence({ keys: ['name'] });
+  const _reactPublishEmoji = reactRoom.usePublishTopic('emoji');
   const _reactPresenceUser = reactPresence.user!;
   const _reactPresencePeers = reactPresence.peers!;
+  _reactPresenceUser.name;
+  _reactPresencePeers[0].name;
+
+  const reactPresenceNew = reactDB.rooms.usePresence(reactRoom, {
+    keys: ['name'],
+  });
+  const _reactPublishEmojiNew = reactDB.rooms.usePublishTopic(
+    reactRoom,
+    'emoji',
+  );
+  const _reactPresenceUserNew = reactPresenceNew.user!;
+  const _reactPresencePeersNew = reactPresenceNew.peers!;
+  _reactPresenceUserNew.name;
+  _reactPresencePeersNew[0].name;
+
   // queries
   const { isLoading, error, data } = reactDB.useQuery({ messages: {} });
   if (isLoading || error) {
@@ -98,14 +113,17 @@ function ReactNormalApp() {
   // transactions
   reactDB.transact(
     reactDB.tx.messages[id()]
-      .update({ content: "Hello world" })
-      .link({ creator: "foo" }),
+      .update({ content: 'Hello world' })
+      .link({ creator: 'foo' }),
   );
 
   // to silence ts warnings
   _reactPublishEmoji;
   _reactPresenceUser;
-  _reactPresencePeers;
+  _reactPresencePeersNew;
+  _reactPublishEmojiNew;
+  _reactPresenceUserNew;
+  _reactPresencePeersNew;
   messages;
 }
 
@@ -118,11 +136,26 @@ const reactNativeDB = react_native_init<SchemaDef>({
 
 function ReactNativeNormalApp() {
   // rooms
-  const reactRoom = reactNativeDB.room("chat");
-  const reactPresence = reactRoom.usePresence({ keys: ["name"] });
-  const _reactPublishEmoji = reactRoom.usePublishTopic("emoji");
+  const reactRoom = reactNativeDB.room('chat');
+  const reactPresence = reactRoom.usePresence({ keys: ['name'] });
+  const _reactPublishEmoji = reactRoom.usePublishTopic('emoji');
   const _reactPresenceUser = reactPresence.user!;
   const _reactPresencePeers = reactPresence.peers!;
+  _reactPresenceUser.name;
+  _reactPresencePeers[0].name;
+
+  const reactPresenceNew = reactNativeDB.rooms.usePresence(reactRoom, {
+    keys: ['name'],
+  });
+  const _reactPublishEmojiNew = reactNativeDB.rooms.usePublishTopic(
+    reactRoom,
+    'emoji',
+  );
+  const _reactPresenceUserNew = reactPresenceNew.user!;
+  const _reactPresencePeersNew = reactPresenceNew.peers!;
+  _reactPresenceUserNew.name;
+  _reactPresencePeersNew[0].name;
+
   // queries
   const { isLoading, error, data } = reactNativeDB.useQuery({
     messages: {},
@@ -136,6 +169,9 @@ function ReactNativeNormalApp() {
   _reactPublishEmoji;
   _reactPresenceUser;
   _reactPresencePeers;
+  _reactPublishEmojiNew;
+  _reactPresenceUserNew;
+  _reactPresencePeersNew;
   messages;
 }
 
@@ -154,8 +190,8 @@ adminQueryResult.messages[0].content;
 // transacts
 await adminDB.transact(
   adminDB.tx.messages[id()]
-    .update({ content: "Hello world" })
-    .link({ creator: "foo" }),
+    .update({ content: 'Hello world' })
+    .link({ creator: 'foo' }),
 );
 
 // to silence ts warnings

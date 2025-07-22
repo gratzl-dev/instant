@@ -8,8 +8,7 @@
             [instant.db.transaction :as tx]
             [instant.jdbc.aurora :as aurora]
             [instant.model.app :as app-model]
-            [instant.reactive.ephemeral :as eph]
-            [instant.reactive.receive-queue :refer [receive-q]]
+            [instant.reactive.receive-queue :as receive-queue]
             [instant.reactive.session :as session]
             [instant.reactive.store :as store]
             [instant.util.instaql :refer [instaql-nodes->object-tree]]
@@ -46,8 +45,8 @@
                     (:processed-tx-id msg)))
 
     (tracer/record-info! {:name "flags-impl/unexpected-op"
-                          :op (:op msg)
-                          :msg msg})))
+                          :attributes {:op (:op msg)
+                                       :msg msg}})))
 
 (defn init
   "Creates a subscription to the config app, fetching all of the data."
@@ -57,7 +56,7 @@
           attrs (attr-model/get-by-app-id config-app-id)
           ctx {:app-id (:id app)
                :attrs attrs
-               :db {:conn-pool (aurora/conn-pool)}}
+               :db {:conn-pool (aurora/conn-pool :read)}}
           query->transform (zipmap (map :query queries)
                                    (map :transform queries))
           ws-conn {:websocket-stub (fn [msg] (handle-msg query-results-atom
@@ -66,7 +65,7 @@
           socket {:id socket-id
                   :http-req nil
                   :ws-conn ws-conn
-                  :receive-q receive-q
+                  :receive-q receive-queue/receive-q
                   :pending-handlers (atom #{})}]
 
       ;; Get results in foreground so that flags are initialized before we return
@@ -75,21 +74,19 @@
                     result (instaql-nodes->object-tree ctx data)]]
         (swap-result! query-results-atom query transform result 0))
 
-      (session/on-open store/store-conn socket)
-      (store/set-auth! store/store-conn
-                       socket-id
-                       {:app app
-                        :admin? true})
+      (session/on-open store/store socket)
+      (store/assoc-session! store/store
+                            socket-id
+                            :session/auth {:app app
+                                           :admin? true})
       (doseq [{:keys [query]} queries]
         (session/on-message {:id socket-id
-                             :receive-q receive-q
+                             :receive-q receive-queue/receive-q
                              :data (->json {:op :add-query
                                             :q query
                                             :return-type "tree"})}))
       (fn []
-        (session/on-close store/store-conn
-                          eph/ephemeral-store-atom
-                          socket)
+        (session/on-close store/store socket)
         nil))))
 
 (defn resolve-attr-id [attrs namespaced-attr]
@@ -109,7 +106,7 @@
           machine-attr-id (resolve-attr-id
                            attrs
                            :app-users-to-triples-migration/processId)]
-      (tx/transact! (aurora/conn-pool)
+      (tx/transact! (aurora/conn-pool :write)
                     attrs
                     config-app-id
                     [[:add-triple eid id-attr-id eid]
@@ -125,7 +122,7 @@
                            attrs
                            :app-users-to-triples-migration/processId)
           ctx {:attrs attrs
-               :db {:conn-pool (aurora/conn-pool)}
+               :db {:conn-pool (aurora/conn-pool :read)}
                :app-id config-app-id}
           eids (-> (datalog/query ctx [[:ea '?e]
                                        [:ea '?e #{machine-attr-id} #{@config/process-id}]
@@ -133,7 +130,7 @@
                    :symbol-values
                    (get '?e))]
       (when (seq eids)
-        (tx/transact! (aurora/conn-pool)
+        (tx/transact! (aurora/conn-pool :write)
                       attrs
                       config-app-id
                       (map (fn [eid]

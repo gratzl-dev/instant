@@ -22,33 +22,38 @@
      3. Use pgjdbc's `replicationAPI` to start a stream."
   (:require
    [chime.core :as chime-core]
+   [clojure.core.async :as a]
+   [instant.aurora-config :as aurora-config]
    [instant.config :as config]
    [instant.discord :as discord]
+   [instant.gauges :as gauges]
    [instant.health :as health]
-   [instant.jdbc.sql :as sql]
    [instant.jdbc.aurora :as aurora]
-   [instant.util.json :refer [<-json]]
+   [instant.jdbc.sql :as sql]
    [instant.util.async :as ua]
-   [clojure.core.async :as a]
-   [next.jdbc.connection :refer [jdbc-url]]
+   [instant.util.lang :as lang]
+   [instant.util.json :refer [<-json]]
    [instant.util.tracer :as tracer]
-   [lambdaisland.uri :as uri])
+   [lambdaisland.uri :as uri]
+   [next.jdbc.connection :refer [jdbc-url]])
   (:import
-   (java.util Properties)
    (java.nio ByteBuffer)
+   (java.sql Connection DriverManager)
    (java.time Duration Instant)
-   (org.postgresql PGProperty PGConnection)
-   (org.postgresql.replication PGReplicationStream LogSequenceNumber)
-   (java.sql DriverManager)))
+   (java.util Properties)
+   (java.util.concurrent TimeUnit)
+   (org.postgresql PGConnection PGProperty)
+   (org.postgresql.replication LogSequenceNumber PGReplicationStream)
+   (org.postgresql.replication.fluent.logical ChainedLogicalStreamBuilder)))
 
 ;; ----
 ;; Connection
 
-(defn jdbc-username [db-spec]
-  (or (:username db-spec)
+(defn jdbc-username ^String [db-spec]
+  (or (:user db-spec)
       (:user (uri/query-map (jdbc-url db-spec)))))
 
-(defn jdbc-password [db-spec]
+(defn jdbc-password ^String [db-spec]
   (or (:password db-spec)
       (:password (uri/query-map (jdbc-url db-spec)))))
 
@@ -58,13 +63,20 @@
    This PG connection has a few special settings to support replication
    (e.g REPLICATION, ASSUME_MIN_SERVER_VERSION, PREFER_QUERY_MODE)"
   ^PGConnection [db-spec]
-  (let [props (Properties.)
+  (let [db-spec (if-let [secret-arn (:secret-arn db-spec)]
+                  (-> db-spec
+                      (dissoc db-spec :secret-arn)
+                      (merge (aurora-config/secret-arn->db-creds secret-arn)))
+                  db-spec)
+        props (Properties.)
         _ (do (.set PGProperty/USER props (jdbc-username db-spec))
               (.set PGProperty/PASSWORD props (jdbc-password db-spec))
               (.set PGProperty/REPLICATION props "database")
               (.set PGProperty/ASSUME_MIN_SERVER_VERSION props "9.4")
               (.set PGProperty/PREFER_QUERY_MODE props "simple"))
-        conn (DriverManager/getConnection (jdbc-url db-spec) props)]
+        conn (DriverManager/getConnection (jdbc-url (-> db-spec
+                                                        (dissoc :user :password)))
+                                          props)]
     (.unwrap conn PGConnection)))
 
 (comment
@@ -118,6 +130,16 @@
                      WHERE slot_name = ?"
                    slot-name]))
 
+(defn get-replication-latency-bytes [conn slot-name]
+  (->
+   (sql/select-one
+    conn
+    ["select pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) as latency
+        from pg_replication_slots
+       where slot_name = ?"
+     slot-name])
+   :latency))
+
 (defn drop-logical-replication-slot [conn slot-name]
   (sql/execute! conn
                 ["SELECT pg_drop_replication_slot(?)" slot-name]))
@@ -147,7 +169,7 @@
   (def pg-conn (get-pg-replication-conn (config/get-aurora-config)))
   (create-temporary-logical-replication-slot! pg-conn "test_slot" "wal2json")
   (.close pg-conn)
-  (get-all-slots (aurora/conn-pool)))
+  (get-all-slots (aurora/conn-pool :read)))
 
 ;; -------------------------
 ;; LSN
@@ -160,7 +182,7 @@
    (sql/select-one conn ["SELECT * FROM pg_current_wal_lsn();"])))
 
 (comment
-  (get-current-wal-lsn (aurora/conn-pool)))
+  (get-current-wal-lsn (aurora/conn-pool :read)))
 
 ;; ------
 ;; Stream
@@ -173,16 +195,17 @@
    a PGConnection with some specific settings. Use `get-pg-replication-conn`
    to get the right kind of PGConnection."
   ^PGReplicationStream
-  [^PGConnection replication-conn slot-name start-lsn version]
-  (-> replication-conn
-      (.getReplicationAPI)
-      (.replicationStream)
-      (.logical)
-      (.withSlotName slot-name)
-      (.withSlotOption "include-lsn" true)
-      (.withSlotOption "format-version" version)
-      (.withStartPosition (LogSequenceNumber/valueOf start-lsn))
-      (.start)))
+  [^PGConnection replication-conn slot-name ^String start-lsn ^Long version]
+  (let [builder (-> replication-conn
+                    (.getReplicationAPI)
+                    (.replicationStream)
+                    (.logical)
+                    (.withSlotOption "include-lsn" true)
+                    (.withSlotOption "format-version" version)
+                    (.withStartPosition (LogSequenceNumber/valueOf start-lsn))
+                    (.withSlotName slot-name)
+                    (.withStatusInterval 1 TimeUnit/SECONDS))]
+    (.start ^ChainedLogicalStreamBuilder builder)))
 
 (defn kw-action [action]
   (case action
@@ -206,7 +229,9 @@
         record-len (- (count src) offset)
         json-str (String. src offset record-len)
         record (<-json json-str true)]
-    (update record :action kw-action)))
+    (-> record
+        (update :action kw-action)
+        (assoc :tx-bytes record-len))))
 
 (comment
   (wal-buffer->record (ByteBuffer/wrap (.getBytes "{\"x\": 1}"))))
@@ -220,55 +245,60 @@
                                    :record record}}
     next-state))
 
+(def produce-start-state {:next-action :begin
+                          :records []
+                          :tx-bytes 0})
+
 (defn- produce
   "Repeatedly read from the stream and >!! records to the `to` channel.
 
    We do some book-keeping for the replication stream, by recording the LSN
    for the last record that was pushed to `to`."
-  [stream to close-signal-chan]
+  [^PGReplicationStream stream to close-signal-chan]
   ;; :next-action is either:
   ;;   :begin, we're waiting for a :begin record
   ;;   :close, we got :begin and we're collecting records until we get :close
   ;;   :deliver, we got close and we need to proceed to the invalidator
   (loop [buffer (.read stream)
-         state {:next-action :begin
-                :records []}]
+         state produce-start-state]
     (if-not buffer
       (when-not (.isClosed stream)
         (recur (.read stream) state))
       (let [record (wal-buffer->record buffer)
-            next-state (case (:next-action state)
-                         :begin (case (:action record)
-                                  :begin (-> state
-                                             (assoc :next-action :close))
-                                  (unexpected-state state
-                                                    record
-                                                    ;; Let's just reset
-                                                    {:next-action :close
-                                                     :records []}))
-                         :close (case (:action record)
-                                  (:insert :update :delete) (update state :records conj record)
+            next-state (-> (case (:next-action state)
+                             :begin (case (:action record)
+                                      :begin (-> state
+                                                 (assoc :next-action :close))
+                                      (unexpected-state state
+                                                        record
+                                                        ;; Let's just reset
+                                                        {:next-action :close
+                                                         :records []}))
+                             :close (case (:action record)
+                                      (:insert :update :delete) (update state :records conj record)
 
-                                  ;; Don't handle truncate or message
-                                  (:truncate :message) state
+                                      ;; Don't handle truncate or message
+                                      (:truncate :message) state
 
-                                  :close (assoc state :next-action :deliver)
+                                      :close (assoc state :next-action :deliver)
 
-                                  :begin (unexpected-state state
-                                                           record
-                                                           {:next-action :close
-                                                            :records []})
-                                  (unexpected-state state
-                                                    record
-                                                    ;; Just keep going
-                                                    state))
-                         (unexpected-state state record state))]
+                                      :begin (unexpected-state state
+                                                               record
+                                                               {:next-action :close
+                                                                :records []})
+                                      (unexpected-state state
+                                                        record
+                                                        ;; Just keep going
+                                                        state))
+                             (unexpected-state state record state))
+                           (update :tx-bytes (fnil + 0) (:tx-bytes record)))]
         (if (not= :deliver (:next-action next-state))
           (recur (.read stream) next-state)
           (let [last-receive-lsn ^LogSequenceNumber (.getLastReceiveLSN stream)
                 msg {:changes (:records state)
-                     :nextlsn (LogSequenceNumber/valueOf (:nextlsn record))
-                     :lsn (LogSequenceNumber/valueOf (:lsn record))}
+                     :nextlsn (LogSequenceNumber/valueOf ^String (:nextlsn record))
+                     :lsn (LogSequenceNumber/valueOf ^String (:lsn record))
+                     :tx-bytes (:tx-bytes state)}
                 put-result (a/alt!! [[to msg]] :put
                                     ;; The close signal chan keeps us from
                                     ;; waiting to put on a closed `to` channel
@@ -277,15 +307,14 @@
                        (not (.isClosed stream)))
               (.setAppliedLSN stream last-receive-lsn)
               (.setFlushedLSN stream last-receive-lsn)
-              (recur (.read stream) {:next-action :begin
-                                     :records []}))))))))
+              (recur (.read stream) produce-start-state))))))))
 
 (defn make-wal-opts [{:keys [wal-chan close-signal-chan
-                             ex-handler conn-config slot-name]}]
+                             ex-handler get-conn-config slot-name]}]
   {:to wal-chan
    :close-signal-chan close-signal-chan
    :ex-handler ex-handler
-   :conn-config conn-config
+   :get-conn-config get-conn-config
    :slot-name slot-name
    :shutdown-fn (atom nil)
    :started-promise (promise)})
@@ -297,10 +326,15 @@
              (throw (Exception. "shutdown-fn already set for wal worker"))
              shutdown-fn))))
 
+(defn closed? [o]
+  (condp instance? o
+    Connection (Connection/.isClosed o)
+    PGReplicationStream (PGReplicationStream/.isClosed o)))
+
 (defn close-nicely [closeable]
-  (when-not (.isClosed closeable)
-    (let [close-error (try (.close closeable) (catch Exception e e))]
-      (when-not (.isClosed closeable)
+  (when-not (closed? closeable)
+    (let [close-error (try (lang/close closeable) (catch Exception e e))]
+      (when-not (closed? closeable)
         (throw (ex-info "Unable to close" {} close-error))))))
 
 (defn alert-discord [slot-name]
@@ -314,9 +348,9 @@
 
 (defn get-reconnect-conn*
   "Tries to create a new connection and restart the replication stream"
-  [conn-config slot-name]
+  [get-conn-config slot-name]
   (try
-    (let [conn (get-pg-replication-conn conn-config)]
+    (let [conn (get-pg-replication-conn (get-conn-config))]
       ;; try is double-nested so that we can dispose of the connection
       ;; if we get an error creating the stream.
       (try
@@ -336,9 +370,9 @@
 (defn get-reconnect-conn
   "Repeatedly tries to create a new connection and restart the replication stream,
    waiting a second between tries."
-  [conn-config slot-name]
+  [get-conn-config slot-name]
   (loop [i 1]
-    (if-let [res (get-reconnect-conn* conn-config slot-name)]
+    (if-let [res (get-reconnect-conn* get-conn-config slot-name)]
       res
       (do
         (tracer/record-info! {:name "wal/get-reconnect-conn"
@@ -353,9 +387,9 @@
    Note: Blocks the calling thread. Call with fut-bg.
 
    Use `shutdown!` to stop the stream and clean up."
-  [{:keys [conn-config slot-name to ex-handler close-signal-chan started-promise]
+  [{:keys [get-conn-config slot-name to ex-handler close-signal-chan started-promise]
     :as wal-opts}]
-  (let [replication-conn (get-pg-replication-conn conn-config)
+  (let [replication-conn (get-pg-replication-conn (get-conn-config))
         {:keys [lsn]} (create-logical-replication-slot! replication-conn
                                                         slot-name
                                                         "wal2json")
@@ -387,7 +421,7 @@
                                           :escpaing? false})
           (try (close-nicely stream) (catch Exception _e nil))
           (try (close-nicely replication-conn) (catch Exception _e nil))
-          (let [{new-conn :conn stream :stream} (get-reconnect-conn conn-config slot-name)]
+          (let [{new-conn :conn stream :stream} (get-reconnect-conn get-conn-config slot-name)]
             (if-not stream
               (ex-handler produce-error)
               (do
@@ -409,8 +443,17 @@
                                      {:name "wal-worker/shutdown-called-before-startup"
                                       :escaping? false}))))
 
-(defn init-cleanup []
-  (def schedule
+(defn cleanup-slots-impl [inactive-slots]
+  (tracer/with-span! {:name "wal/cleanup-inactive-slots"}
+    (let [slot-names (map :slot_name inactive-slots)
+          removed    (cleanup-inactive-replication-slots (aurora/conn-pool :write) slot-names)
+          cleaned    (set (map :slot_name removed))
+          uncleaned  (remove #(contains? cleaned %) slot-names)]
+      (tracer/add-data! {:attributes {:cleaned-slot-names cleaned
+                                      :active-uncleaned-slots uncleaned}}))))
+
+(defn start []
+  (def cleanup-slots-schedule
     (chime-core/chime-at
      (chime-core/periodic-seq (Instant/now) (Duration/ofHours 1))
      (fn [_time]
@@ -418,23 +461,47 @@
        ;; still inactive in 5 minutes. This will prevent dropping slots that
        ;; are still being set up.
        (try
-         (let [conn-pool      (aurora/conn-pool)
+         (let [conn-pool      (aurora/conn-pool :read)
                inactive-slots (get-inactive-replication-slots conn-pool)]
            (when (seq inactive-slots)
-             (chime-core/chime-at
-              [(.plusSeconds (Instant/now) 300)]
-              (fn [_time]
-                (tracer/with-span! {:name "wal/cleanup-inactive-slots"}
-                  (let [slot-names (map :slot_name inactive-slots)
-                        removed    (cleanup-inactive-replication-slots (aurora/conn-pool) slot-names)
-                        cleaned    (set (map :slot_name removed))
-                        uncleaned  (remove #(contains? cleaned %) slot-names)]
-                    (tracer/add-data! {:attributes {:cleaned-slot-names cleaned
-                                                    :active-uncleaned-slots uncleaned}})))))))
+             (def cleanup-slots-impl-schedule
+               (chime-core/chime-at
+                [(.plusSeconds (Instant/now) 300)]
+                (fn [_time]
+                  (cleanup-slots-impl inactive-slots))))))
          (catch Exception e
            (tracer/record-exception-span! e {:name "wal/cleanup-error"
-                                             :escaping? false})))))))
+                                             :escaping? false}))))))
 
+  (let [replication-latency-bytes (atom 0)]
+    (def latency-schedule
+      (chime-core/chime-at
+       (rest (chime-core/periodic-seq (Instant/now) (Duration/ofMinutes 1)))
+       (fn [_time]
+         (try
+           (let [latency (get-replication-latency-bytes (aurora/conn-pool :read) @config/process-id)]
+             (reset! replication-latency-bytes latency))
+           (catch Exception e
+             (tracer/record-exception-span! e {:name "wal/check-latency-error"
+                                               :escaping? false}))))))
+
+    (def cleanup-gauge
+      (gauges/add-gauge-metrics-fn
+       (fn [_]
+         [{:path "instant.jdb.wal.replication-latency-bytes"
+           :value @replication-latency-bytes}])))))
+
+(defn stop []
+  (lang/close cleanup-slots-schedule)
+  (lang/close cleanup-slots-impl-schedule)
+  (lang/close latency-schedule)
+  (cleanup-gauge))
+
+(defn before-ns-unload []
+  (stop))
+
+(defn after-ns-reload []
+  (start))
 
 (comment
   (def shutdown? (atom false))

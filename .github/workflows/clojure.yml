@@ -33,6 +33,10 @@ jobs:
             echo "did_change=True" >> $GITHUB_OUTPUT
             break
           fi
+          if echo $file | grep -E '.github/workflows/clojure.yml'; then
+            echo "did_change=True" >> $GITHUB_OUTPUT
+            break
+          fi
         done
 
   clj-check:
@@ -42,7 +46,7 @@ jobs:
 
     services:
       postgres:
-        image: public.ecr.aws/z9j8u5b3/instant-public:postgres-16
+        image: public.ecr.aws/z9j8u5b3/instant-public:postgresql-16-pg-hint-plan
         ports:
           - 5432:5432
         env:
@@ -63,6 +67,7 @@ jobs:
     - name: Prepare database
       env:
         DATABASE_URL: "postgres://test_user:test_password@localhost:5432/test_db?sslmode=disable"
+      timeout-minutes: 1
       run: |
         curl -L "https://github.com/golang-migrate/migrate/releases/download/v4.17.0/migrate.linux-amd64.tar.gz" | tar xvz
         chmod +x migrate
@@ -74,10 +79,11 @@ jobs:
            -source file://server/resources/migrations \
            -database $DATABASE_URL \
            up
-        ./server/dev-resources/import_test_data.sh
+
+        psql -d $DATABASE_URL -c "select version()"
 
     - name: Install clojure tools
-      uses: DeLaGuardo/setup-clojure@10.2
+      uses: DeLaGuardo/setup-clojure@13.1
       with:
         cli: 1.11.3.1463
 
@@ -94,6 +100,10 @@ jobs:
     - name: Install Clojure dependencies
       working-directory: server
       run: clojure -P
+
+    - name: Compile java src files
+      working-directory: server
+      run: clojure -T:build compile-java
 
     - name: Run Clojure tests
       working-directory: server
@@ -124,7 +134,7 @@ jobs:
         java-version: '22'
 
     - name: Install clojure tools
-      uses: DeLaGuardo/setup-clojure@10.2
+      uses: DeLaGuardo/setup-clojure@13.1
       with:
         cli: 1.11.3.1463
 
@@ -162,7 +172,7 @@ jobs:
         java-version: '22'
 
     - name: Install clojure tools
-      uses: DeLaGuardo/setup-clojure@10.2
+      uses: DeLaGuardo/setup-clojure@13.1
       with:
         cli: 1.11.3.1463
 
@@ -186,7 +196,7 @@ jobs:
 
   publish-image:
     runs-on: ubuntu-latest
-    if: needs.detect_clj.outputs.did_change == 'True' && github.ref == 'refs/heads/main'
+    if: (needs.detect_clj.outputs.did_change == 'True' && github.ref == 'refs/heads/main') || contains(github.event.head_commit.message, '[staging]')
     # Start publish image if we have clj changes
     needs: [ detect_clj ]
     permissions:
@@ -250,7 +260,7 @@ jobs:
       uses: "./.github/actions/elastic-beanstalk"
       with:
         working-directory: "server"
-        files: '["docker-compose.yml", ".ebextensions/resources.config"]'
+        files: '["docker-compose.yml", ".ebextensions/resources.config", ".ebextensions/sysctl.config", ".platform/hooks/prebuild/prebuild.sh", ".platform/hooks/postdeploy/cloudwatch.sh"]'
         aws-region: "us-east-1"
         bucket: "elasticbeanstalk-us-east-1-597134865416"
         application-name: "instant-docker-prod"

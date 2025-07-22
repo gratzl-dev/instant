@@ -1,7 +1,13 @@
 {
   "name": "@instantdb/react-native",
-  "version": "v0.17.3",
+  "version": "v0.20.10",
   "description": "Instant DB for React Native",
+  "homepage": "https://github.com/instantdb/instant/tree/main/client/packages/react-native",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/instantdb/instant.git",
+    "directory": "client/packages/react-native"
+  },
   "main": "dist/index.js",
   "module": "dist/module/index.js",
   "types": "dist/module/index.d.ts",
@@ -9,12 +15,12 @@
   "scripts": {
     "test": "vitest",
     "build": "rm -rf dist; npm run build:main && npm run build:module",
-    "dev:main": "tsc -p tsconfig.json -w --skipLibCheck",
-    "dev:module": "tsc -p tsconfig.module.json -w --skipLibCheck",
+    "dev:main": "tsc -p tsconfig.json -w --skipLibCheck --preserveWatchOutput | grep -v '^$'",
+    "dev:module": "tsc -p tsconfig.module.json -w --skipLibCheck --preserveWatchOutput | grep -v '^$'",
     "dev": "run-p dev:main dev:module",
     "build:main": "tsc -p tsconfig.json",
     "build:module": "tsc -p tsconfig.module.json",
-    "publish-package": "npm publish --access public"
+    "publish-package": "pnpm publish --access public --no-git-checks"
   },
   "devDependencies": {
     "@babel/core": "^7.17.9",
@@ -22,7 +28,7 @@
     "@types/node": "^22.6.1",
     "@types/react": ">=16",
     "npm-run-all": "^4.1.5",
-    "typescript": "^5.5.4",
+    "typescript": "^5.8.3",
     "vitest": "^0.21.0"
   },
   "peerDependencies": {

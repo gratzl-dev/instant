@@ -11,7 +11,7 @@ import {
   Fragment,
   PropsWithChildren,
 } from 'react';
-import { Editor, OnMount } from '@monaco-editor/react';
+import { Editor, Monaco, OnMount } from '@monaco-editor/react';
 import {
   Dialog as HeadlessDialog,
   Popover,
@@ -19,19 +19,28 @@ import {
   PopoverPanel,
 } from '@headlessui/react';
 import * as HeadlessToggleGroup from '@radix-ui/react-toggle-group';
-import Highlight, { defaultProps } from 'prism-react-renderer';
+import Highlight, { defaultProps, Prism } from 'prism-react-renderer';
+
+if (typeof global !== 'undefined') {
+  (global as any).Prism = Prism;
+} else {
+  (window as any).Prism = Prism;
+}
+
+require('prismjs/components/prism-clojure');
 
 import {
   CheckCircleIcon,
-  ClipboardCopyIcon,
-  XIcon,
+  ClipboardDocumentIcon,
+  XMarkIcon,
   EyeIcon,
-  EyeOffIcon,
-} from '@heroicons/react/solid';
-import { InformationCircleIcon } from '@heroicons/react/outline';
+  EyeSlashIcon,
+} from '@heroicons/react/24/solid';
+import { InformationCircleIcon } from '@heroicons/react/24/outline';
 import { errorToast, successToast } from '@/lib/toast';
 import CopyToClipboard from 'react-copy-to-clipboard';
 import copy from 'copy-to-clipboard';
+import Link from 'next/link';
 
 // content
 
@@ -57,6 +66,14 @@ export const LogoIcon = ({ size = 'mini' }: { size?: 'mini' | 'normal' }) => {
 
 // controls
 
+export type TabItem = {
+  id: string;
+  label: ReactNode;
+  link?: { href: string; target?: '_blank' };
+};
+
+export type TabButton = Omit<TabItem, 'link'>;
+
 export function ToggleCollection({
   className,
   buttonClassName,
@@ -67,19 +84,18 @@ export function ToggleCollection({
 }: {
   className?: string;
   buttonClassName?: string;
-  items: { id: string; label: ReactNode; link?: string }[];
+  items: TabItem[];
   selectedId?: string;
   disabled?: boolean;
-  onChange: (tab: { id: string; label: ReactNode; link?: string }) => void;
+  onChange: (tab: TabButton) => void;
 }) {
   return (
     <div className={cn('flex w-full flex-col gap-0.5', className)}>
       {items.map((a) =>
         a.link ? (
-          <a
+          <Link
             key={a.id}
-            href={a.link}
-            target="_blank"
+            {...a.link}
             rel="noopener noreferer"
             className={clsx(
               'block cursor-pointer truncate whitespace-nowrap rounded bg-none px-3 py-1 text-left hover:bg-gray-100 disabled:text-gray-400',
@@ -90,7 +106,7 @@ export function ToggleCollection({
             )}
           >
             {a.label}
-          </a>
+          </Link>
         ) : (
           <button
             key={a.id}
@@ -172,6 +188,8 @@ export function TextInput({
   tabIndex,
   disabled,
   title,
+  required,
+  onBlur,
 }: {
   value: string;
   type?: 'text' | 'email' | 'sensitive' | 'password';
@@ -186,6 +204,8 @@ export function TextInput({
   tabIndex?: number;
   disabled?: boolean | undefined;
   title?: string | undefined;
+  required?: boolean | undefined;
+  onBlur?: (e: React.FocusEvent<HTMLInputElement>) => void;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -221,7 +241,9 @@ export function TextInput({
           onChange(e.target.value);
         }}
         onKeyDown={onKeyDown}
+        onBlur={onBlur}
         tabIndex={tabIndex}
+        required={required}
       />
       {error ? <div className="text-sm text-red-600">{error}</div> : null}
     </label>
@@ -242,7 +264,7 @@ export function TextArea({
   disabled,
   title,
   cols,
-  rows
+  rows,
 }: {
   value: string;
   className?: string;
@@ -313,7 +335,10 @@ export function Checkbox({
   checked: boolean;
   className?: string;
   labelClassName?: string;
-  onChange: (checked: boolean) => void;
+  onChange: (
+    checked: boolean,
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => void;
   required?: boolean;
   disabled?: boolean | undefined;
   title?: string | undefined;
@@ -321,7 +346,8 @@ export function Checkbox({
   return (
     <label
       className={cn(
-        'flex cursor-pointer items-center gap-2 disabled:cursor-default',
+        'flex cursor-pointer items-top gap-2',
+        disabled ? 'text-gray-400 cursor-default' : '',
         labelClassName,
       )}
       title={title}
@@ -331,19 +357,22 @@ export function Checkbox({
         title={title}
         required={required}
         className={cn(
-          'align-middle font-medium text-gray-900 disabled:text-gray-400 disabled:bg-gray-400',
+          'align-middle mt-0.5 font-medium text-gray-900 disabled:border-gray-300 disabled:bg-gray-200',
           className,
         )}
         type="checkbox"
         checked={checked}
-        onChange={(e) => onChange(e.target.checked)}
+        onChange={(e) => onChange(e.target.checked, e)}
       />{' '}
       {label}
       {error ? <div className="text-sm text-red-600">{error}</div> : null}
     </label>
   );
 }
-export function Select({
+
+export function Select<
+  Value extends string | number | readonly string[] = string,
+>({
   value,
   options,
   className,
@@ -354,9 +383,9 @@ export function Select({
   title,
 }: {
   value?: string;
-  options: { label: string; value: string }[];
+  options: { label: string; value: Value }[];
   className?: string;
-  onChange: (option?: { label: string; value: string }) => void;
+  onChange: (option?: { label: string; value: Value }) => void;
   disabled?: boolean;
   emptyLabel?: string;
   tabIndex?: number;
@@ -380,7 +409,7 @@ export function Select({
     >
       {options.length ? (
         options.map((option) => (
-          <option key={option.value} value={option.value}>
+          <option key={option.label} value={option.value}>
             {option.label}
           </option>
         ))
@@ -393,8 +422,6 @@ export function Select({
   );
 }
 
-export type TabBarTab = { id: string; label: string; link?: string };
-
 export function TabBar({
   className,
   selectedId,
@@ -403,10 +430,10 @@ export function TabBar({
   onSelect,
 }: {
   className?: string;
-  tabs: TabBarTab[];
+  tabs: TabItem[];
   selectedId: string;
   disabled?: boolean;
-  onSelect: (tab: { id: string; label: string }) => void;
+  onSelect: (tab: TabButton) => void;
 }) {
   return (
     <div
@@ -417,10 +444,9 @@ export function TabBar({
     >
       {tabs.map((t) =>
         t.link ? (
-          <a
+          <Link
             key={t.id}
-            href={t.link}
-            target="_blank"
+            {...t.link}
             rel="noopener noreferer"
             className={clsx(
               'flex cursor-pointer whitespace-nowrap bg-none px-4 py-0.5 disabled:text-gray-400 rounded hover:bg-gray-100',
@@ -430,7 +456,7 @@ export function TabBar({
             )}
           >
             {t.label}
-          </a>
+          </Link>
         ) : (
           <button
             key={t.id}
@@ -523,7 +549,8 @@ export function Button({
       'text-sm px-2 py-0.5': size === 'mini',
       'text-xs px-2 py-0': size === 'nano',
       'cursor-not-allowed': disabled,
-      'cursor-wait opacity-75': loading, // Apply wait cursor and lower opacity when loading
+      'cursor-wait opacity-75': loading, // Apply wait cursor and lower opacity when loading,
+      'bg-gray-200 text-gray-400': variant == 'cta' && disabled,
     },
     className,
   );
@@ -595,7 +622,7 @@ export function Dialog({
       <div className="fixed inset-0 z-50 bg-black/50" aria-hidden="true" />
       <div className="fixed inset-4 z-50 flex flex-col items-center justify-center">
         <HeadlessDialog.Panel className="relative w-full max-w-xl overflow-y-auto rounded bg-white p-3 text-sm shadow">
-          <XIcon
+          <XMarkIcon
             className="absolute right-3 top-[18px] h-4 w-4 cursor-pointer"
             onClick={onClose}
           />
@@ -663,8 +690,9 @@ export function ActionButton({
       }
     } catch (error) {
       if ((error as any)?.hint) {
-        const msg = `${errorMessage}\n${(error as any).message}\n${
-          (error as any).hint?.errors?.[0]?.message
+        const hintMessage = (error as any).hint?.errors?.[0]?.message;
+        const msg = `${errorMessage}\n${(error as any).message}${
+          hintMessage ? `\n${hintMessage}` : ''
         }`;
         errorToast(msg);
       } else {
@@ -691,7 +719,7 @@ export function ActionButton({
 }
 // other
 
-function redactedValue(v: string): string {
+export function redactedValue(v: string): string {
   if (v.length === 36 && v.indexOf('-') === 8) {
     // Probably a uuid, so preserve the dashes
     return v.replaceAll(/[^-]/g, '*');
@@ -703,19 +731,24 @@ export function Copyable({
   value,
   label,
   size = 'normal',
+  defaultHidden,
   hideValue,
   onChangeHideValue,
+  multiline,
 }: {
   value: string;
-  label: string;
+  label?: string;
   size?: 'normal' | 'large';
+  defaultHidden?: boolean;
   hideValue?: boolean;
   onChangeHideValue?: () => void;
+  multiline?: boolean;
 }) {
+  const [hidden, setHidden] = useState(defaultHidden);
   const [copyLabel, setCopyLabel] = useState('Copy');
-  const sizeToStyle = {
-    normal: { main: 'text-sm', copy: 'text-xs' },
-  };
+  const handleChangeHideValue =
+    onChangeHideValue || (defaultHidden ? () => setHidden(!hidden) : null);
+
   return (
     <div
       className={cn('flex items-center rounded border bg-white font-mono', {
@@ -723,9 +756,22 @@ export function Copyable({
         'text-base': size === 'large',
       })}
     >
-      <div className="border-r bg-gray-50 px-3 py-1.5" style={{borderTopLeftRadius: "calc(0.25rem - 1px)", borderBottomLeftRadius: "calc(0.25rem - 1px)"}}>{label}</div>
+      {label ? (
+        <div
+          className="border-r bg-gray-50 px-3 py-1.5"
+          style={{
+            borderTopLeftRadius: 'calc(0.25rem - 1px)',
+            borderBottomLeftRadius: 'calc(0.25rem - 1px)',
+          }}
+        >
+          {label}
+        </div>
+      ) : null}
       <pre
-        className="flex-1 truncate px-4 py-1.5"
+        className={clsx('flex-1 px-4 py-1.5', {
+          truncate: !multiline,
+          'whitespace-pre-wrap break-all': multiline,
+        })}
         title={value}
         onClick={(e) => {
           const el = e.target as HTMLPreElement;
@@ -736,19 +782,19 @@ export function Copyable({
           selection.selectAllChildren(el);
         }}
       >
-        {hideValue ? redactedValue(value) : value}
+        {hideValue || hidden ? redactedValue(value) : value}
       </pre>
       <div className="flex gap-1 px-1">
-        {!!onChangeHideValue && (
+        {!!handleChangeHideValue && (
           <button
-            onClick={onChangeHideValue}
+            onClick={handleChangeHideValue}
             className={cn(
               'flex items-center gap-x-1 rounded-sm bg-white px-2 py-1 ring-1 ring-inset ring-gray-300 hover:bg-gray-50',
               { 'text-xs': size === 'normal', 'text-sm': size === 'large' },
             )}
           >
-            {hideValue ? (
-              <EyeOffIcon className="h-4 w-4" aria-hidden="true" />
+            {hideValue || hidden ? (
+              <EyeSlashIcon className="h-4 w-4" aria-hidden="true" />
             ) : (
               <EyeIcon className="h-4 w-4" aria-hidden="true" />
             )}
@@ -767,7 +813,10 @@ export function Copyable({
               { 'text-xs': size === 'normal', 'text-sm': size === 'large' },
             )}
           >
-            <ClipboardCopyIcon className="-ml-0.5 h-4 w-4" aria-hidden="true" />
+            <ClipboardDocumentIcon
+              className="-ml-0.5 h-4 w-4"
+              aria-hidden="true"
+            />
             {copyLabel}
           </button>
         </CopyToClipboard>
@@ -808,7 +857,10 @@ export function Copytext({ value }: { value: string }) {
         {showCopied ? (
           <CheckCircleIcon className="pl-1" height={'1em'} />
         ) : (
-          <ClipboardCopyIcon className="cursor-pointer pl-1" height={'1em'} />
+          <ClipboardDocumentIcon
+            className="cursor-pointer pl-1"
+            height={'1em'}
+          />
         )}
       </CopyToClipboard>
     </span>
@@ -823,9 +875,12 @@ export function CodeEditor(props: {
   onMount?: OnMount;
   path?: string;
   tabIndex?: number;
+  loading?: boolean;
+  readOnly?: boolean;
 }) {
   return (
     <Editor
+      className={props.loading ? 'animate-pulse' : undefined}
       height={'100%'}
       language={props.language}
       value={props.value ?? ''}
@@ -837,12 +892,14 @@ export function CodeEditor(props: {
         minimap: { enabled: false },
         automaticLayout: true,
         tabIndex: props.tabIndex,
+        readOnly: props.readOnly,
       }}
       onChange={(value) => {
         props.onChange(value || '');
       }}
       onMount={props.onMount}
       beforeMount={(monaco) => {}}
+      loading={<FullscreenLoading />}
     />
   );
 }
@@ -855,38 +912,46 @@ export function JSONEditor(props: {
 }) {
   const [draft, setDraft] = useState(props.value);
 
+  const [monacoInstance, setMonacomonacoInstance] = useState<Monaco | null>(
+    null,
+  );
+
   useEffect(() => {
     setDraft(props.value);
   }, [props.value]);
 
+  useEffect(() => {
+    if (monacoInstance && props.schema) {
+      monacoInstance.languages.json.jsonDefaults.setDiagnosticsOptions({
+        validate: true,
+        schemas: [
+          {
+            uri: 'http://myserver/myJsonTypeSchema', // A URI for your schema (can be a dummy URI)
+            fileMatch: ['*'], // Associate with your model
+            schema: props.schema,
+          },
+        ],
+      });
+    }
+  }, [monacoInstance, props.schema]);
+
   return (
-    <div className="flex flex-col gap-2 h-full">
+    <div className="flex flex-col gap-2 h-full min-h-0">
       <div className="flex items-center gap-4 border-b px-4 py-2">
         <div className="font-mono">{props.label}</div>
         <Button onClick={() => props.onSave(draft)}>Save</Button>
       </div>
-      <div className="flex-grow">
+      <div className="flex-grow min-h-0">
         <CodeEditor
           language="json"
           value={props.value}
           onChange={(draft) => setDraft(draft)}
           onMount={function handleEditorDidMount(editor, monaco) {
+            setMonacomonacoInstance(monaco);
             // cmd+S binding to save
             editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () =>
               props.onSave(editor.getValue()),
             );
-
-            if (!props.schema) return;
-            monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
-              validate: true,
-              schemas: [
-                {
-                  uri: 'http://myserver/myJsonTypeSchema', // A URI for your schema (can be a dummy URI)
-                  fileMatch: ['*'], // Associate with your model
-                  schema: props.schema,
-                },
-              ],
-            });
           }}
         />
       </div>
@@ -947,7 +1012,7 @@ export function Fence({
                 }}
                 className="flex items-center gap-x-1 rounded-sm bg-white px-2 py-1 ring-1 ring-inset ring-gray-300 hover:bg-gray-50 text-xs"
               >
-                <ClipboardCopyIcon
+                <ClipboardDocumentIcon
                   className="-ml-0.5 h-4 w-4"
                   aria-hidden="true"
                 />
@@ -960,9 +1025,10 @@ export function Fence({
               <Fragment key={lineIndex}>
                 {line
                   .filter((token) => !token.empty)
-                  .map((token, tokenIndex) => (
-                    <span key={tokenIndex} {...getTokenProps({ token })} />
-                  ))}
+                  .map((token, tokenIndex) => {
+                    const { key, ...props } = getTokenProps({ token });
+                    return <span key={key || tokenIndex} {...props} />;
+                  })}
                 {'\n'}
               </Fragment>
             ))}
@@ -1016,6 +1082,51 @@ export const InfoTip = ({ children }: PropsWithChildren) => {
   );
 };
 
+export function ProgressButton({
+  percentage = 0,
+  loading,
+  className,
+  children,
+  variant,
+  ...props
+}: PropsWithChildren<{
+  percentage?: number;
+  loading?: boolean;
+  className?: string;
+  variant?: 'primary' | 'secondary' | 'subtle' | 'destructive' | 'cta';
+}> &
+  Parameters<typeof Button>[0]) {
+  const progressFillStyle = {
+    transform: loading
+      ? `scaleX(${Math.max(0, Math.min(100, percentage)) / 100})`
+      : 'scaleX(0)',
+    transition: 'transform 0.3s ease-in-out',
+    transformOrigin: 'left',
+  };
+
+  const progressFillClass = cn('absolute inset-0 transition-all', {
+    'bg-[#4543e9]': variant === 'primary' || !variant,
+    'bg-orange-500': variant === 'cta',
+    'bg-gray-200': variant === 'secondary',
+    'bg-gray-300': variant === 'subtle',
+    'bg-red-200': variant === 'destructive',
+  });
+
+  return (
+    <Button
+      {...props}
+      variant={variant}
+      loading={loading}
+      className={cn('relative overflow-hidden', className)}
+    >
+      {loading && (
+        <div className={progressFillClass} style={progressFillStyle} />
+      )}
+      <span className="relative z-10">{children}</span>
+    </Button>
+  );
+}
+
 // utils
 
 export function twel<T = {}>(
@@ -1032,4 +1143,10 @@ export function twel<T = {}>(
 
 export function cn(...inputs: clsx.ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+export function FullscreenLoading() {
+  return (
+    <div className="animate-slow-pulse flex w-full flex-1 flex-col bg-gray-300"></div>
+  );
 }

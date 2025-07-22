@@ -211,5 +211,41 @@
     ],
     "unique?": false,
     "index?": false
+  },
+  {
+    "id": "ddf89ebc-71e9-4a9b-80f2-9c2380949661",
+    "value-type": "ref",
+    "cardinality": "one",
+    "forward-identity": [
+      "caec81f9-5f14-4376-9842-fc0e6143c3ce",
+      "books",
+      "prequel"
+    ],
+    "reverse-identity": [
+      "e0b307a2-0679-4490-ba58-e9a5a17e4901",
+      "books",
+      "sequels"
+    ],
+    "unique?": false,
+    "index?": false,
+    "on-delete": "cascade"
+  },
+  {
+    "id": "f187a211-a2ef-48cc-8beb-e1abe01dedfe",
+    "value-type": "ref",
+    "cardinality": "many",
+    "forward-identity": [
+      "e2f733eb-65ba-4a70-aa66-96aa0a51cdaa",
+      "books",
+      "next"
+    ],
+    "reverse-identity": [
+      "67e8fe91-22bd-4d94-b44b-6c8f6bbc9a2a",
+      "books",
+      "previous"
+    ],
+    "unique?": true,
+    "index?": false,
+    "on-delete-reverse": "cascade"
   }
 ]

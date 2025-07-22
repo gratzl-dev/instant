@@ -5,16 +5,18 @@
    [instant.model.app :as app-model]
    [instant.model.instant-user :as instant-user-model]
    [instant.model.rule :as rule-model]
+   [instant.model.schema :as schema-model]
    [instant.util.date :as date]
    [instant.util.exception :as ex]
+   [instant.util.lang :as lang]
    [instant.util.string :as string-util]
    [instant.util.tracer :as tracer]
    [instant.util.uuid :as uuid-util]
    [ring.util.http-response :as response])
   (:import
-   (java.time Period)
+   (java.time Period ZonedDateTime)
    (java.time.temporal ChronoUnit)
-   (java.util UUID)))
+   (java.util Date UUID)))
 
 (def ephemeral-creator-email (if (= (config/get-env) :dev)
                                "hello+ephemeralappsdev@instantdb.com"
@@ -36,9 +38,9 @@
 
 (defn app-expires-ms [app]
   (-> app
-      :created_at
+      ^Date (:created_at)
       (.toInstant)
-      (.plus expiration-days ChronoUnit/DAYS)
+      (.plus (long expiration-days) ChronoUnit/DAYS)
       (.toEpochMilli)))
 
 ;; -----------
@@ -46,6 +48,7 @@
 
 (defn http-post-handler [req]
   (let [title (ex/get-param! req [:body :title] string-util/coerce-non-blank-str)
+        schema (get-in req [:body :schema])
         rules-code (get-in req [:body :rules :code])
         _ (when rules-code
             (ex/assert-valid! :rule rules-code (rule-model/validation-errors
@@ -54,6 +57,12 @@
     (when rules-code
       (rule-model/put! {:app-id (:id app)
                         :code rules-code}))
+    (when schema
+      (->> schema
+           (schema-model/plan! {:app-id (:id app)
+                                :check-types? true
+                                :background-updates? false})
+           (schema-model/apply-plan! (:id app))))
     (response/ok {:app app
                   :expires_ms (app-expires-ms app)})))
 
@@ -87,7 +96,7 @@
                       (Period/ofDays 1))]
 
     (->> periodic-seq
-         (filter (fn [x] (.isAfter x now))))))
+         (filter (fn [x] (ZonedDateTime/.isAfter x now))))))
 
 (comment
   (first (period)))
@@ -96,8 +105,9 @@
   (let [app-ids (app-model/get-app-ids-created-before {:creator-id (:id @ephemeral-creator)
                                                        :created-before created-before})]
     (tracer/add-data!
-     {:created-before created-before
-      :num-apps (count app-ids)})
+     {:attributes
+      {:created-before created-before
+       :num-apps (count app-ids)}})
     (when (seq app-ids)
       (app-model/delete-by-ids! {:creator-id (:id @ephemeral-creator)
                                  :ids app-ids}))))
@@ -112,10 +122,11 @@
 
 (defn start []
   (tracer/record-info! {:name "ephemeral-app-sweeper/schedule"})
-  (def schedule (chime-core/chime-at (period) handle-sweep)))
+  (def schedule
+    (chime-core/chime-at (period) handle-sweep)))
 
 (defn stop []
-  (.close schedule))
+  (lang/close schedule))
 
 (defn restart []
   (stop)
