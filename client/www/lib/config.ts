@@ -16,8 +16,8 @@ if (devBackend && isBrowser) {
 }
 
 const config = {
-  apiURI: process.env.NEXT_PUBLIC_API_URI,
-  websocketURI: process.env.NEXT_PUBLIC_WEBSOCKET_URI
+  apiURI: process.env.NEXT_PUBLIC_API_URI ?? '',
+  websocketURI: process.env.NEXT_PUBLIC_WEBSOCKET_URI ?? ''
 };
 
 export default config;
